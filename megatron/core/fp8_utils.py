@@ -106,10 +106,11 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
 
 def get_fp8_align_size(fp8_recipe: Fp8Recipe) -> int:
     """Get the alignment size required for fp8 GEMM."""
-    if fp8_recipe == Fp8Recipe.mxfp8:
-        return 32
-    else:
-        return 16
+    # if fp8_recipe == Fp8Recipe.mxfp8:
+    #     return 32
+    # else:
+    #     return 16
+    return 32
 
 
 """
