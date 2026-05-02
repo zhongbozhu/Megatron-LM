@@ -2658,6 +2658,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
 
+    def refill_param_gather_buffer_from_main_params(self):
+        """
+        Copy local main-param shards into the param-gather buffer.
+
+        This is used when param_data is a temporary gather buffer rather than the
+        storage directly backing param.data. The current user is the MXFP8 param
+        gather path that borrows grad storage, and the same contract can be used
+        by future quantized primary-weight paths.
+        """
+        assert self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag and self.ddp_config.overlap_param_gather
+        self._copy_main_params_to_param_buffer()
+
     def _copy_main_params_to_param_buffer(self):
         """
         This function is only used for MXFP8 params.
