@@ -1861,22 +1861,20 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         else:
             adjust_tensor_shapes_fn = None
 
-        # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
-        # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
-        # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+        # For quantized params that reuse the grad buffer as a param-gather buffer,
+        # refill the gather buffer after zero_grad_buffer() because param and grad
+        # buffer are the same storage.
         #
         # However, we should skip this on the first iteration when forward_pre_hook is disabled,
         # because:
         # 1. The first iteration's params are already in param.data (from init or checkpoint).
         # 2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
         #    so the main grads will be polluted by the main params.
-        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+        if needs_shared_param_buffer_refill(args):
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             if forward_pre_hook_enabled:
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance._copy_main_params_to_param_buffer()
+                refill_param_gather_buffer_from_main_params(optimizer)
 
         # Forward pass.
         if save_activations_in_this_iteration:
@@ -2405,16 +2403,55 @@ def enable_forward_pre_hook(model_chunks):
         model_chunk.enable_forward_pre_hook()
 
 
-def disable_forward_pre_hook(model_chunks, param_sync=True):
+def _iter_distributed_optimizers(optimizer):
+    if optimizer is None:
+        return
+    for optim_instance in getattr(optimizer, "chained_optimizers", [optimizer]):
+        if isinstance(optim_instance, DistributedOptimizer):
+            yield optim_instance
+
+
+def needs_shared_param_buffer_refill(args):
+    return args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+
+
+def refill_param_gather_buffer_from_main_params(optimizer):
+    if not needs_shared_param_buffer_refill(get_args()):
+        return
+    for optim_instance in _iter_distributed_optimizers(optimizer):
+        optim_instance.refill_param_gather_buffer_from_main_params()
+
+
+def reset_param_sync_state(model_chunks):
+    for model_chunk in model_chunks:
+        if hasattr(model_chunk, "reset_param_sync_state"):
+            model_chunk.reset_param_sync_state()
+
+
+def disable_forward_pre_hook(model_chunks, param_sync=True, optimizer=None):
+    args = get_args()
+    refill_param_gather_buffer = param_sync and needs_shared_param_buffer_refill(args)
+    if refill_param_gather_buffer:
+        reset_param_sync_state(model_chunks)
+        refill_param_gather_buffer_from_main_params(optimizer)
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
+    if refill_param_gather_buffer:
+        reset_param_sync_state(model_chunks)
 
 
-def force_param_sync(model_chunks: list[DDP]) -> None:
+def force_param_sync(model_chunks: list[DDP], optimizer=None) -> None:
+    args = get_args()
+    refill_param_gather_buffer = needs_shared_param_buffer_refill(args)
+    if refill_param_gather_buffer:
+        reset_param_sync_state(model_chunks)
+        refill_param_gather_buffer_from_main_params(optimizer)
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
+    if refill_param_gather_buffer:
+        reset_param_sync_state(model_chunks)
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
@@ -2436,7 +2473,7 @@ def save_checkpoint_and_time(
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
-        force_param_sync(model)
+        force_param_sync(model, optimizer=optimizer)
 
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
@@ -2535,7 +2572,7 @@ def post_training_step_callbacks(
         and iteration % args.check_weight_hash_across_dp_replicas_interval == 0
     ):
         if should_disable_forward_pre_hook(args):
-            disable_forward_pre_hook(model)
+            disable_forward_pre_hook(model, optimizer=optimizer)
         assert check_param_hashes_across_dp_replicas(
             model, cross_check=True
         ), "Parameter hashes not matching across DP replicas"
@@ -3238,7 +3275,7 @@ def train(
                 energy_monitor.pause()
             timers('interval-time').stop()
             if should_disable_forward_pre_hook(args):
-                disable_forward_pre_hook(model)
+                disable_forward_pre_hook(model, optimizer=optimizer)
                 pre_hook_enabled = False
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
@@ -3282,6 +3319,8 @@ def train(
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
             if should_disable_forward_pre_hook(args):
+                if needs_shared_param_buffer_refill(args):
+                    reset_param_sync_state(model)
                 enable_forward_pre_hook(model)
                 pre_hook_enabled = True
             timers('interval-time', log_level=0).start(barrier=True)
@@ -3333,7 +3372,7 @@ def train(
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
-        disable_forward_pre_hook(model)
+        disable_forward_pre_hook(model, optimizer=optimizer)
 
     ft_integration.on_checkpointing_start()
     # This will finalize all unfinalized async request and terminate

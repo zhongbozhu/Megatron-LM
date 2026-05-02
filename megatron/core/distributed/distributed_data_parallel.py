@@ -493,6 +493,13 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_param_sync(force_sync=force_sync)
 
+            if (
+                force_sync
+                and self.ddp_config.overlap_param_gather
+                and self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+            ):
+                bucket_group.finish_param_sync_with_shared_param_buffer()
+
             if not self.ddp_config.overlap_param_gather:
                 # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
                 # the param.data, since param buffer is not mapped to model params for MXFP8 case.
@@ -557,6 +564,11 @@ class DistributedDataParallel(_BaseDataParallel):
         """Free overlap param-gather GPU buffers across all bucket groups."""
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.free_overlap_buffers()
+
+    def reset_param_sync_state(self):
+        """Reset stale param-gather dispatch state after forward-only evaluation."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.reset_param_sync_state()
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""

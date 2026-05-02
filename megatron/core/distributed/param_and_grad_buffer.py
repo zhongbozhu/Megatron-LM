@@ -464,29 +464,10 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
-            # we need to copy the param_data from the shared_param/grad_buffer to param.data
-            # after the param all-gather.
+            # Some quantized params are not directly mapped to param_data. For those
+            # params, copy gathered param_data to param.data and clear the shared buffer.
             if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-                for bucket in self.buckets:
-                    is_bf16_weight_bucket = False
-                    for param in bucket.params:
-                        # Skip copying since bf16 weights in the mxfp8 model
-                        # are already mapped to param.data.
-                        if not is_float8tensor(param):
-                            is_bf16_weight_bucket = True
-                            break
-                        param_start, param_end = bucket.param_to_index[param]
-                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                        param.data.copy_(param_slice.view(param.data.shape))
-                    if is_bf16_weight_bucket:
-                        continue
-                    # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
-                    # We cannot zero out the entire grad buffer because one grad buffer may
-                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
-                    # it would clear the data of those param buffers that have not yet completed AG.
-                    bucket.param_data.zero_()
+                self.finish_param_sync_with_shared_param_buffer()
             elif not self.ddp_config.use_distributed_optimizer:
                 for bucket in self.buckets:
                     if bucket.layerwise_gather_list is None:
@@ -513,6 +494,36 @@ class _ParamAndGradBucketGroup:
                             fp8_params.append(param)
                 if len(fp8_params) > 0:
                     post_all_gather_processing(fp8_params)
+
+    def finish_param_sync_with_shared_param_buffer(self):
+        """Copy gathered quantized params out of shared param/grad storage and clear it."""
+        for bucket in self.buckets:
+            is_bf16_weight_bucket = False
+            for param in bucket.params:
+                # In MXFP8 reuse mode, Float8Tensor params are not mapped to bucket.param_data:
+                # bucket.param_data is only a BF16 shared param/grad staging buffer for AG.
+                # After AG completes, we must explicitly copy the gathered slice into the real
+                # Float8Tensor storage, param.data. Non-FP8 params are different: their param.data
+                # is already backed by bucket.param_data, so clearing bucket.param_data would also
+                # clear the model weight. Skip such mixed buckets here.
+                if not is_float8tensor(param):
+                    is_bf16_weight_bucket = True
+                    break
+                param_start, param_end = bucket.param_to_index[param]
+                param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                param.data.copy_(param_slice.view(param.data.shape))
+            if is_bf16_weight_bucket:
+                continue
+            # All-gathered params are not needed after being copied to param.data.
+            # Zero only this param buffer view because it is shared with grad_data.
+            bucket.param_data.zero_()
+
+    def reset_param_sync_state(self):
+        """Clear stale param-gather state without zeroing the shared param/grad buffer."""
+        if self.param_gather_handle is not None:
+            self.param_gather_handle.wait()
+            self.param_gather_handle = None
+        self.param_gather_dispatched = False
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
