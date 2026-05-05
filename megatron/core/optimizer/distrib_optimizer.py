@@ -49,7 +49,13 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
-from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
+from ..fp8_utils import (
+    dequantize_fp8_tensor,
+    get_grouped_tensor_quantized_members,
+    is_float8tensor,
+    is_grouped_tensor_with_quantized_storage,
+    quantize_param_shard,
+)
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
@@ -940,18 +946,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return tensors
 
     @staticmethod
-    def _is_grouped_quantized_tensor(tensor: torch.Tensor) -> bool:
-        """Check if tensor is a TE GroupedTensor using quantized storage."""
-        return (
-            hasattr(tensor, "split_into_quantized_tensors")
-            and callable(tensor.split_into_quantized_tensors)
-            and getattr(tensor, "quantizer", None) is not None
-        )
-
-    @classmethod
-    def _is_distopt_quantized_param(cls, tensor: torch.Tensor) -> bool:
+    def _is_distopt_quantized_param(tensor: torch.Tensor) -> bool:
         """Check if tensor should follow quantized parameter path in dist optimizer."""
-        return is_float8tensor(tensor) or cls._is_grouped_quantized_tensor(tensor)
+        return is_float8tensor(tensor) or is_grouped_tensor_with_quantized_storage(tensor)
 
     def _expand_quantized_param_shard_for_cast(
         self,
@@ -965,12 +962,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         master slice to per-member offset ranges, while preserving deterministic ordering across
         DP ranks.
         """
-        if not self._is_grouped_quantized_tensor(model_param):
+        if not is_grouped_tensor_with_quantized_storage(model_param):
             return [model_param], [shard_main_param], [start_offset]
 
-        quantized_members = model_param.quantized_tensors
-        if quantized_members is None:
-            quantized_members = model_param.split_into_quantized_tensors()
+        quantized_members = get_grouped_tensor_quantized_members(model_param)
 
         shard_start = 0 if start_offset is None else start_offset
         shard_size = 0 if shard_main_param is None else shard_main_param.numel()
@@ -2779,7 +2774,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         model_param = model_param_to_state_dict_param_map[model_param]
 
                     if self._is_distopt_quantized_param(model_param):
-                        if self._is_grouped_quantized_tensor(model_param):
+                        if is_grouped_tensor_with_quantized_storage(model_param):
                             dequantized_model_param = model_param.float()
                         else:
                             dequantized_model_param = dequantize_fp8_tensor(model_param)

@@ -23,7 +23,10 @@ from megatron.core.utils import log_single_rank
 from ..fp4_utils import get_nvfp4_rowwise_packed_shape, is_nvfp4tensor
 from ..fp8_utils import (
     is_float8tensor,
+    is_grouped_tensor,
+    is_grouped_tensor_with_quantized_storage,
     is_mxfp8tensor,
+    modify_grouped_tensor_underlying_storage,
     modify_underlying_storage,
     post_all_gather_processing,
 )
@@ -66,6 +69,17 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
         buffer[(r * shard_size) : ((r + 1) * shard_size)] for r in range(data_parallel_world_size)
     ]
     return sharded_buffer
+
+
+def _param_uses_quantized_storage(param: torch.nn.Parameter) -> bool:
+    """Return whether the parameter owns TE quantized storage instead of plain tensor storage."""
+    # In TE2, is_float8tensor() checks QuantizedTensor, so it includes plain MXFP8Tensor.
+    # Grouped MXFP8 is a GroupedTensor wrapper, so it needs an explicit grouped-storage check.
+    return (
+        is_float8tensor(param)
+        or is_nvfp4tensor(param)
+        or is_grouped_tensor_with_quantized_storage(param)
+    )
 
 
 class _ParamAndGradBucket:
@@ -490,26 +504,25 @@ class _ParamAndGradBucketGroup:
                             model_p.data.copy_(updated_p)
                     bucket.layerwise_gather_list = None
             else:
-                fp8_params = []
+                quantized_params = []
                 for bucket in self.buckets:
                     for param in bucket.params:
-                        if is_float8tensor(param):
-                            fp8_params.append(param)
-                if len(fp8_params) > 0:
-                    post_all_gather_processing(fp8_params)
+                        if _param_uses_quantized_storage(param):
+                            quantized_params.append(param)
+                if len(quantized_params) > 0:
+                    post_all_gather_processing(quantized_params)
 
     def finish_param_sync_with_shared_param_buffer(self):
         """Copy gathered quantized params out of shared param/grad storage and clear it."""
         for bucket in self.buckets:
             is_bf16_weight_bucket = False
             for param in bucket.params:
-                # In MXFP8 reuse mode, Float8Tensor params are not mapped to bucket.param_data:
-                # bucket.param_data is only a BF16 shared param/grad staging buffer for AG.
-                # After AG completes, we must explicitly copy the gathered slice into the real
-                # Float8Tensor storage, param.data. Non-FP8 params are different: their param.data
-                # is already backed by bucket.param_data, so clearing bucket.param_data would also
-                # clear the model weight. Skip such mixed buckets here.
-                if not is_float8tensor(param):
+                # Quantized params are not directly mapped to bucket.param_data in the reuse path:
+                # bucket.param_data is only a high-precision shared staging buffer for AG. After AG
+                # completes, copy the gathered slice into the real quantized parameter storage.
+                # Non-quantized params are already backed by bucket.param_data, so skip mixed
+                # buckets to avoid clearing live model weights.
+                if not _param_uses_quantized_storage(param):
                     is_bf16_weight_bucket = True
                     break
                 param_start, param_end = bucket.param_to_index[param]
@@ -1102,11 +1115,15 @@ class _ParamAndGradBuffer:
             mem_alloc_context = nullcontext
 
         with mem_alloc_context():
-            # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
-            # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
-            # It can be temporarily reused by param AG.
-            if self.ddp_config.use_distributed_optimizer and any(
-                is_mxfp8tensor(p) for p in self.params
+            # Create a shared buffer for high-precision param AG and grad RS. The buffer is mapped
+            # to weight gradients whose dtype is either bf16 or FP32, and can be temporarily reused
+            # by param AG.
+            if self.ddp_config.use_distributed_optimizer and (
+                any(is_mxfp8tensor(p) for p in self.params)
+                or (
+                    self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                    and any(_param_uses_quantized_storage(p) for p in self.params)
+                )
             ):
                 self.shared_buffer = torch.zeros(
                     self.numel,
@@ -1184,9 +1201,13 @@ class _ParamAndGradBuffer:
             nvfp4_packed_param_start_index = None
             if self.has_nvfp4_params:
                 nvfp4_packed_param_start_index, _, _ = self.nvfp4_packed_param_index_map[param]
-            # For MXFP8 param:
-            # we only need to map bf16 weights (layernorm, embedding, etc) to the buffer.
-            if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag or not is_mxfp8tensor(param):
+            # For quantized params using the high-precision param AG buffer, keep param.data
+            # attached to its quantized storage. Non-quantized weights are still mapped to the
+            # param buffer.
+            if (
+                not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                or not _param_uses_quantized_storage(param)
+            ):
                 if self.param_data is not None:
                     if is_nvfp4tensor(param):
                         # Remap the NVFP4 tensor's internal rowwise uint8 storage so it
@@ -1201,6 +1222,25 @@ class _ParamAndGradBuffer:
                             buffer_type=BufferType.PARAM,
                         )
                         modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                    elif is_grouped_tensor_with_quantized_storage(param):
+                        raise RuntimeError(
+                            "Single grouped quantized weights do not support quantize-before-"
+                            "all-gather: TE has per-tensor partial cast kernels, but no grouped "
+                            "partial cast kernel. Use high-precision param all-gather with "
+                            "--reuse-grad-buf-for-mxfp8-param-ag."
+                        )
+                    elif is_grouped_tensor(param):
+                        # Keep the GroupedTensor wrapper and metadata intact. Only its BF16/FP16
+                        # backing rowwise buffer should point into the contiguous DDP param buffer.
+                        assert (
+                            not self.has_nvfp4_params
+                        ), "Non-quantized GroupedTensor params should use full-numel buffer offsets."
+                        new_param_data = self._get(
+                            param.data.shape,
+                            param_start_index,
+                            buffer_type=BufferType.PARAM,
+                        )
+                        modify_grouped_tensor_underlying_storage(param, new_param_data)
                     elif is_float8tensor(param):
                         new_param_data = self._get(
                             param.data.shape,
