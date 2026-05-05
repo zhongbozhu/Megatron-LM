@@ -177,8 +177,8 @@ class OptimizerConfig:
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
-    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+    """If true, reuse the grad buffer as a high-precision param AG buffer for quantized
+       primary weights that cannot use the quantize-before-AG path."""
 
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
@@ -330,7 +330,7 @@ class OptimizerConfig:
     """If true, overlap param all-gather with forward compute. 
         This argument is intended to have the same value as the "overlap_param_gather" argument 
         in the "distributed_data_parallel_config.py" file. In the optimizer, this argument is 
-        only used when "reuse_grad_buf_for_mxfp8_param_ag=True & fp8_param_gather=True".
+        only used when reuse_grad_buf_for_mxfp8_param_ag=True.
     """
 
     overlap_param_gather_with_optimizer_step: bool = False

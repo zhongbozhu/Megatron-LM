@@ -2657,19 +2657,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         Copy local main-param shards into the param-gather buffer.
 
-        This is used when param_data is a temporary gather buffer rather than the
-        storage directly backing param.data. The current user is the MXFP8 param
-        gather path that borrows grad storage, and the same contract can be used
-        by future quantized primary-weight paths.
+        This is used when param_data is a temporary high-precision gather buffer rather than
+        the storage directly backing param.data.
         """
-        assert self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag and self.ddp_config.overlap_param_gather
+        assert (
+            self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+            and self.ddp_config.overlap_param_gather
+        )
         self._copy_main_params_to_param_buffer()
 
     def _copy_main_params_to_param_buffer(self):
         """
-        This function is only used for MXFP8 params.
-        Copy FP32 main params directly to param buffer for param all-gather since
-        param buffer is not mapped to model params for MXFP8 case.
+        Copy FP32 main params directly to the high-precision param all-gather buffer.
 
         """
         if self.ddp_config.use_megatron_fsdp:

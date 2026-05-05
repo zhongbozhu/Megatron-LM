@@ -831,6 +831,10 @@ class _ParamAndGradBuffer:
         self.ddp_config = ddp_config
         self.params = [param for (param, _) in params_with_names]
         self.param_indices = param_indices
+        self.reuse_param_gather_buffer_for_quantized_params = (
+            self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+            and any(_param_uses_quantized_storage(p) for p in self.params)
+        )
 
         # Check that params are unique.
         unique_params = set()
@@ -985,6 +989,11 @@ class _ParamAndGradBuffer:
         #   - nvfp4_packed_param_index_map: offsets into the packed param buffer (numel // 2).
         #
         self.has_nvfp4_params = any(is_nvfp4tensor(p) for p in self.params)
+        # In reuse mode, NVFP4 uses the high-precision param AG buffer. The packed-byte
+        # NVFP4 index space is only for the quantize-before-AG path.
+        self.has_nvfp4_params = (
+            self.has_nvfp4_params and not self.reuse_param_gather_buffer_for_quantized_params
+        )
         # Secondary (packed) index map, counters, and bucket tracking for NVFP4.
         self.nvfp4_packed_param_index_map = {} if self.has_nvfp4_params else None
         nvfp4_packed_param_start_index = 0 if self.has_nvfp4_params else None
@@ -1120,10 +1129,7 @@ class _ParamAndGradBuffer:
             # by param AG.
             if self.ddp_config.use_distributed_optimizer and (
                 any(is_mxfp8tensor(p) for p in self.params)
-                or (
-                    self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                    and any(_param_uses_quantized_storage(p) for p in self.params)
-                )
+                or self.reuse_param_gather_buffer_for_quantized_params
             ):
                 self.shared_buffer = torch.zeros(
                     self.numel,
@@ -1224,10 +1230,9 @@ class _ParamAndGradBuffer:
                         modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
                     elif is_grouped_tensor_with_quantized_storage(param):
                         raise RuntimeError(
-                            "Single grouped quantized weights do not support quantize-before-"
-                            "all-gather: TE has per-tensor partial cast kernels, but no grouped "
-                            "partial cast kernel. Use high-precision param all-gather with "
-                            "--reuse-grad-buf-for-mxfp8-param-ag."
+                            "Single grouped quantized weights require high-precision param AG: "
+                            "quantize-before-AG needs grouped partial-cast kernels that TE does "
+                            "not provide. Use --reuse-grad-buf-for-mxfp8-param-ag."
                         )
                     elif is_grouped_tensor(param):
                         # Keep the GroupedTensor wrapper and metadata intact. Only its BF16/FP16

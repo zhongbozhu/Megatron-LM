@@ -1202,6 +1202,16 @@ def validate_args(args, defaults={}):
         ), "FSDP manual registration is only supported with Megatron FSDP."
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
 
+    if args.reuse_grad_buf_for_mxfp8_param_ag and not (
+        (args.fp8_param_gather and args.fp8_recipe == 'mxfp8')
+        or (args.fp4_param_gather and args.fp4_recipe == 'nvfp4')
+    ):
+        raise ValueError(
+            "--reuse-grad-buf-for-mxfp8-param-ag/--reuse-grad-buf-for-param-ag requires either "
+            "--fp8-param-gather with --fp8-recipe=mxfp8 or "
+            "--fp4-param-gather with --fp4-recipe=nvfp4."
+        )
+
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
@@ -3664,8 +3674,13 @@ def _add_mixed_precision_args(parser):
     )
     group.add_argument(
         '--reuse-grad-buf-for-mxfp8-param-ag',
+        '--reuse-grad-buf-for-param-ag',
+        dest='reuse_grad_buf_for_mxfp8_param_ag',
         action='store_true',
-        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.',
+        help=(
+            'If True, reuse the grad buffer as a high-precision parameter all-gather buffer '
+            'for MXFP8, or for the NVFP4 fallback path.'
+        ),
     )
 
     return parser
