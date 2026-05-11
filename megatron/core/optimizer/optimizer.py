@@ -1284,12 +1284,45 @@ class ChainedOptimizer(MegatronOptimizer):
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
         success = True
-        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
-            success &= optimizer.step_with_ready_grads()
-            if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
-                assert success
-                assert len(optimizer.model_chunks) == 1
-                optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+        defer_param_sync = (
+            self.config.reuse_grad_buf_for_mxfp8_param_ag
+            and not self.config.overlap_param_gather
+        )
+        deferred_model_chunks = []
+        deferred_model_chunk_ids = set()
+
+        if defer_param_sync:
+            from .distrib_optimizer import DistributedOptimizer
+
+            # With MXFP8 grad-buffer reuse, param all-gather reads from the same DDP
+            # buffers that each DistributedOptimizer fills from its master weights.
+            # For chained optimizers, wait until every optimizer has filled its own
+            # buffers before launching a model-wide param sync.
+            for optimizer in self.chained_optimizers:
+                if isinstance(optimizer, DistributedOptimizer):
+                    optimizer._defer_param_sync_after_step = True
+                    for model_chunk in optimizer.model_chunks:
+                        model_chunk_id = id(model_chunk)
+                        if model_chunk_id not in deferred_model_chunk_ids:
+                            deferred_model_chunk_ids.add(model_chunk_id)
+                            deferred_model_chunks.append(model_chunk)
+
+        try:
+            for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+                success &= optimizer.step_with_ready_grads()
+                if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
+                    assert success
+                    assert len(optimizer.model_chunks) == 1
+                    optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+        finally:
+            if defer_param_sync:
+                for optimizer in self.chained_optimizers:
+                    if hasattr(optimizer, '_defer_param_sync_after_step'):
+                        optimizer._defer_param_sync_after_step = False
+
+        if defer_param_sync:
+            for model_chunk in deferred_model_chunks:
+                model_chunk.start_param_sync()
 
         return success
 
