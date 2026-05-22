@@ -161,9 +161,11 @@ from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     configure_nvtx_profiling,
     get_attr_wrapped_model,
+    get_batch_on_this_cp_rank,
     get_model_config,
     get_pg_rank,
     get_pg_size,
+    unwrap_model,
 )
 from megatron.training.checkpointing import (
     checkpoint_exists,
@@ -212,10 +214,9 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
     is_hybrid_model,
 )
+from megatron.training.utils.common_utils import get_batch_on_this_tp_rank
 
 try:
     from torch_memory_saver import torch_memory_saver
@@ -267,7 +268,6 @@ from .utils import (
     reduce_max_stat_across_model_parallel_group,
     report_memory,
     to_empty_if_meta_device,
-    unwrap_model,
     update_use_dist_ckpt,
 )
 
@@ -1121,7 +1121,7 @@ def pretrain(
         set_ideal_affinity_for_current_gpu()
 
     if cfg_container.logger.log_progress:
-        append_to_progress_log("Starting job")
+        append_to_progress_log(args.save, "Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
@@ -2713,6 +2713,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
     append_to_progress_log(
+        args.save,
         f"{saved_ckpt_prefix}\tIteration: {iteration}\t"
         f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
         f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"

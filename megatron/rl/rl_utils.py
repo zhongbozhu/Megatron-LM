@@ -55,6 +55,7 @@ from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
     log_single_rank,
+    unwrap_model,
 )
 from megatron.rl.agent.api import (
     EvaluationRequest,
@@ -97,7 +98,6 @@ from megatron.training.utils import (
     get_ltor_masks_and_position_ids,
     get_nvtx_range,
     print_rank_0,
-    unwrap_model,
 )
 
 if HAVE_TORCH_MEMORY_SAVER:
