@@ -57,7 +57,12 @@ from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_s
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
+from .optimizer import (
+    MixedPrecisionOptimizer,
+    _zero_grad_group_helper,
+    copy_optimizer_param_metadata,
+    param_group_identifier_keys,
+)
 from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
@@ -392,8 +397,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
-                        if hasattr(model_param, 'shared'):
-                            shard_model_param.shared = model_param.shared
+                        copy_optimizer_param_metadata(shard_model_param, model_param)
 
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -424,8 +428,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
-                        if hasattr(model_param, 'shared'):
-                            shard_main_param.shared = model_param.shared
+                        copy_optimizer_param_metadata(shard_main_param, model_param)
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
                         shard_main_param = None
@@ -447,8 +450,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
-                    if hasattr(model_param, 'shared'):
-                        shard_model_param.shared = model_param.shared
+                    copy_optimizer_param_metadata(shard_model_param, model_param)
 
                 else:
                     raise TypeError(
@@ -887,23 +889,31 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   contains an integer ordering of parameters within each group, and
         #   the ordering of parameters within its flattened parameter state
         #   list.
+
+        # Pair each current param_group with its saved counterpart by identifier tuple.
+        # Construction order isn't part of the checkpoint, so we match by a tuple of
+        # per-group config (``param_group_identifier_keys``) rather than by position.
+
         def make_needed_groups(param_group):
             needed_groups = []
             for key in param_group_identifier_keys:
-                # NeMo changes these variable names from `lr_mult` and `wd_mult`
-                # to `pre_lr_mult` and `pre_wd_mult`, so we need to check both.
+                # NeMo aliases ``lr_mult``/``wd_mult`` as ``pre_lr_mult``/``pre_wd_mult``.
                 if key in param_group:
-                    pass
+                    value = param_group[key]
                 elif f"pre_{key}" in param_group:
-                    key = f"pre_{key}"
+                    value = param_group[f"pre_{key}"]
                 else:
-                    raise ValueError(
-                        f"Key {key} (or pre_{key}) not found in param_group {param_group}."
-                    )
-                needed_groups.append(param_group[key])
-            needed_groups = tuple(needed_groups)
-            return needed_groups
+                    # Treat missing and explicit None identifier values as equivalent.
+                    value = None
+                needed_groups.append(value)
+            return tuple(needed_groups)
 
+        # Duplicate identifiers here silently clobber: two saved groups with the same tuple
+        # collapse to whichever was inserted last, and one current group inherits the wrong
+        # override state (``max_lr`` etc.). Params are unaffected — they come from the
+        # inner optimizer below — but the next step runs at the wrong LR / WD. Adding the
+        # distinguishing field to ``param_group_identifier_keys`` is the fix. See
+        # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
         param_groups_map = {}
         for param_group in state_dict["optimizer"]["param_groups"]:
             needed_groups = make_needed_groups(param_group)
@@ -2794,6 +2804,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
 
+    @torch.no_grad()
+    def prepare_model_params_for_param_sync(self) -> None:
+        """Stage FP32 master shards into DDP param buffers before explicit param sync."""
+        if self.is_stub_optimizer:
+            return
+        if not (self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather):
+            return
+
+        for model_chunk in self.model_chunks:
+            model_chunk.zero_grad_buffer()
+        self._copy_main_params_to_param_buffer()
+
     def _copy_main_params_to_param_buffer(self):
         """
         This function is only used for MXFP8 params.
@@ -2882,6 +2904,47 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for i, tensor in enumerate(split_tensors):
                         state_dict_flat[f"{key_prefix}{indexed_suffixes[i]}"] = tensor
 
+    @staticmethod
+    def _synthesize_state_dict_params_for_model(state_dict_flat, model_chunk):
+        """Let modules materialize runtime params before optimizer state-dict matching.
+
+        This covers modules whose runtime parameter is assembled from multiple checkpoint
+        tensors. Normal model loading can handle this in _load_from_state_dict(), but
+        reload_model_params(state_dict=...) matches optimizer master params directly by name.
+        """
+        for module_name, module in model_chunk.named_modules():
+            synthesize = getattr(module, '_synthesize_fused_qkv_down_weight', None)
+            key_suffixes = getattr(module, '_synthetic_state_dict_key_suffixes', None)
+            if not callable(synthesize) or not callable(key_suffixes):
+                continue
+
+            # Optional compatibility hook contract:
+            # - key_suffixes() returns source checkpoint keys under this module, used only
+            #   to infer checkpoint prefixes despite wrapper-added path segments.
+            # - synthesize(state_dict_flat, module_prefix) mutates the flat checkpoint dict
+            #   in place, materializing runtime parameter names from checkpoint tensors.
+            for inner_key in key_suffixes():
+                for module_prefix in DistributedOptimizer._state_dict_module_prefixes(
+                    state_dict_flat, module_name, inner_key
+                ):
+                    synthesize(state_dict_flat, module_prefix)
+
+    @staticmethod
+    def _state_dict_module_prefixes(state_dict_flat, module_name, inner_key):
+        """Find checkpoint prefixes for a module by suffix-matching one inner key."""
+        module_parts = module_name.split(".") if module_name else []
+        for start_idx in range(len(module_parts) + 1):
+            module_suffix = ".".join(module_parts[start_idx:])
+            key_suffix = f"{module_suffix}.{inner_key}" if module_suffix else inner_key
+            prefixes = {
+                state_key[: len(state_key) - len(inner_key)]
+                for state_key in state_dict_flat
+                if state_key.endswith(key_suffix)
+            }
+            if prefixes:
+                return prefixes
+        return set()
+
     def _build_model_param_to_state_dict_param_map(self, state_dict):
         """Create a map from model params to tensors in state_dict based on their names."""
         state_dict_list = []
@@ -2904,6 +2967,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         model_param_to_state_dict_param_map = {}
         for chunk_idx, model_chunk in enumerate(self.model_chunks):
             self._normalize_state_dict_for_grouped_params(state_dict_list[chunk_idx], model_chunk)
+            self._synthesize_state_dict_params_for_model(state_dict_list[chunk_idx], model_chunk)
             names_in_state_dict = set(state_dict_list[chunk_idx].keys())
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):
