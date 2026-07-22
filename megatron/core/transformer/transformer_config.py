@@ -915,13 +915,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
-    moe_hybridep_pad_variable_tokens: bool = False
-    """Dynamically pad uneven local token counts to the HybridEP group maximum before dispatch.
+    moe_hybridep_pad_uneven_dispatch_inputs: bool = False
+    """Dynamically pad uneven HybridEP dispatch inputs to the group maximum before dispatch.
 
-    Enable this when local token counts can differ across ranks. When disabled, the caller must
-    guarantee equal token counts across the HybridEP communication group, for example by padding
-    THD inputs to a fixed maximum before dispatch. CUDA Graph inputs should be statically padded
-    upstream and leave this option disabled.
+    Enable this when local HybridEP input token counts can differ across ranks, for example
+    with dynamically packed THD inputs. When disabled, the caller must guarantee equal token
+    counts across the HybridEP communication group, for example by statically padding inputs
+    upstream. CUDA Graph inputs should be statically padded upstream and leave this option
+    disabled.
     """
 
     moe_per_layer_logging: bool = False

@@ -78,9 +78,9 @@ def test_set_cudagraph_attr_supports_nested_paths():
     assert dispatcher._comm_manager.routing_map is routing_map
 
 
-def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
+def test_hybridep_uneven_dispatch_inputs_are_padded_to_group_max(monkeypatch):
     manager = object.__new__(_HybridEPManager)
-    manager.config = SimpleNamespace(moe_hybridep_pad_variable_tokens=True)
+    manager.config = SimpleNamespace(moe_hybridep_pad_uneven_dispatch_inputs=True)
     manager.group = object()
     manager.num_experts = 2
     manager.moe_expert_rank_capacity_factor = None
@@ -516,6 +516,49 @@ def skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend):
         pytest.skip("Hybrid EP is not available")
     if moe_flex_dispatcher_backend == "ncclep" and not is_nccl_ep_available():
         pytest.skip("NCCL EP is not available")
+
+
+def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
+    manager = _HybridEPManager.__new__(_HybridEPManager)
+    manager.group = object()
+    manager.num_local_experts = 2
+    manager.num_experts = 4
+    manager.config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_hybridep_pad_uneven_dispatch_inputs=True,
+    )
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+
+    local_num_tokens = 17
+    max_num_tokens_across_ep = 70
+    padded_num_tokens = (
+        max_num_tokens_across_ep + -max_num_tokens_across_ep % HYBRIDEP_TOKEN_ALIGNMENT
+    )
+    routing_map = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.bool)
+    probs = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.float32)
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is manager.group
+        tensor.fill_(max_num_tokens_across_ep)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert manager._original_num_tokens == local_num_tokens
+    assert manager._padded_num_tokens == padded_num_tokens
+    assert manager.routing_map.shape == (padded_num_tokens, manager.num_experts)
+    assert manager.token_probs.shape == (padded_num_tokens, manager.num_experts)
+    torch.testing.assert_close(manager.routing_map[:local_num_tokens], routing_map)
+    torch.testing.assert_close(manager.token_probs[:local_num_tokens], probs)
+    assert not manager.routing_map[local_num_tokens:].any()
+    assert not manager.token_probs[local_num_tokens:].any()
 
 
 @pytest.mark.skipif(
