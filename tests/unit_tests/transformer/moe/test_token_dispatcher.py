@@ -428,7 +428,7 @@ def is_nccl_ep_available():
     return HAVE_TE_EP
 
 
-def test_hybridep_pad_variable_tokens_metadata(monkeypatch):
+def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
     manager = _HybridEPManager.__new__(_HybridEPManager)
     manager.group = object()
     manager.num_local_experts = 2
@@ -439,7 +439,7 @@ def test_hybridep_pad_variable_tokens_metadata(monkeypatch):
         num_attention_heads=4,
         num_moe_experts=4,
         moe_router_topk=2,
-        moe_hybridep_pad_variable_tokens=True,
+        moe_hybridep_pad_uneven_dispatch_inputs=True,
     )
     manager.moe_expert_rank_capacity_factor = None
     manager.drop_and_pad = False
