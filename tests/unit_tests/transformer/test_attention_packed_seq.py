@@ -205,10 +205,12 @@ class TestAttentionDynamicContextParallel:
     """Regression tests for runtime (hybrid/dynamic) CP.
 
     A model built with static context_parallel_size == 1 can be handed a
-    per-microbatch CP group at runtime via PackedSeqParams.cp_group. Two
+    per-microbatch CP group at runtime via PackedSeqParams.cp_group. Three
     contracts must hold: RoPE position math must use that runtime group (not
     the static one), and TEDotProductAttention must lazily create its
-    auxiliary CP stream (the constructor only allocates it for static CP > 1).
+    auxiliary CP stream (the constructor only allocates it for static CP > 1),
+    and local_cp_size == 1 must not carry a cp_group because that convention
+    means CP is disabled for the sub-sample.
     """
 
     def setup_method(self, method):
@@ -354,3 +356,22 @@ class TestAttentionDynamicContextParallel:
 
         assert isinstance(captured.get("stream"), torch.cuda.Stream)
         assert isinstance(TEDotProductAttention.cp_stream, torch.cuda.Stream)
+
+    def test_cp_group_with_local_cp_size_one_is_rejected(self):
+        core_attention = self.parallel_attention.core_attention.cuda()
+        query = torch.zeros(32, 4, 16, dtype=torch.bfloat16, device="cuda")
+        packed_seq_params = make_test_packed_seq_params(32)
+        packed_seq_params.cp_group = torch.distributed.new_group(
+            ranks=[torch.distributed.get_rank()]
+        )
+        packed_seq_params.local_cp_size = 1
+
+        with pytest.raises(AssertionError, match="local_cp_size == 1"):
+            core_attention(
+                query,
+                torch.zeros_like(query),
+                torch.zeros_like(query),
+                None,
+                AttnMaskType.padding_causal,
+                packed_seq_params=packed_seq_params,
+            )
