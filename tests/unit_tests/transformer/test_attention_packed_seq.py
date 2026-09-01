@@ -279,8 +279,8 @@ class TestAttentionDynamicContextParallel:
 
         build_time_group = self.parallel_attention.pg_collection.cp
 
-        # Microbatch with a runtime CP group: RoPE (and the collection) must
-        # use it.
+        # Microbatch with a runtime CP group: RoPE must use it during the
+        # forward, then the collection must restore its build-time group.
         runtime_group = self._runtime_cp_group()
         packed_seq_params = make_test_packed_seq_params(sequence_length)
         packed_seq_params.cp_group = runtime_group
@@ -292,7 +292,7 @@ class TestAttentionDynamicContextParallel:
             packed_seq_params=packed_seq_params,
         )
         assert captured and all(group is runtime_group for group in captured)
-        assert self.parallel_attention.pg_collection.cp is runtime_group
+        assert self.parallel_attention.pg_collection.cp is build_time_group
 
         # Next microbatch without a runtime group (e.g. local_cp_size == 1):
         # the build-time group must be restored, not the previous microbatch's.
