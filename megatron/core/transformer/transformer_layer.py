@@ -978,7 +978,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context
+            pre_mlp_layernorm_output,
+            residual,
+            padding_mask,
+            inference_context,
+            packed_seq_params,
         )
 
         if moe_unflatten_mbs is not None:
@@ -1022,7 +1026,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context
+            pre_mlp_layernorm_output,
+            residual,
+            padding_mask,
+            inference_context,
+            packed_seq_params,
         )
 
         if moe_unflatten_mbs is not None:
@@ -1056,6 +1064,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         residual: Tensor,
         padding_mask: Tensor | None,
         inference_context: BaseInferenceContext | None,
+        packed_seq_params=None,
     ):
         """Execute the MLP submodule with the appropriate variant.
 
@@ -1087,6 +1096,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
+        mlp_kwargs = {"padding_mask": padding_mask}
+        if self.is_moe_layer:
+            mlp_kwargs["packed_seq_params"] = packed_seq_params
+
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
                 # import here to avoid circular import
@@ -1098,11 +1111,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
-                    padding_mask=padding_mask,
+                    **mlp_kwargs,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
+                    functools.partial(apply_module(self.mlp), **mlp_kwargs),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -1134,7 +1147,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask
+                pre_mlp_layernorm_output, **mlp_kwargs
             )
 
         nvtx_range_pop(suffix="mlp")
