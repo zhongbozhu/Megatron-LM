@@ -29,6 +29,33 @@ def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+    training_module._seqlen_stats_are_global = False
+    training_module._seqlen_stats_recording_enabled = True
+
+
+class _FakeModelChunk:
+    def __init__(self, vp_stage):
+        self.vp_stage = vp_stage
+
+
+class _FakeModelWrapper:
+    def __init__(self, module):
+        self.module = module
+
+
+class _ModelWithoutVpStage:
+    pass
+
+
+def _run_forward_stats_update(cu_seqlens, vp_stage, *, record_stats=True):
+    def forward_step(data_iterator, model):
+        update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+        return None
+
+    wrapped = training_module._gate_seqlen_stats_by_vp_stage(
+        forward_step, record_stats=record_stats
+    )
+    return wrapped(None, _FakeModelChunk(vp_stage))
 
 
 def _make_gpt_args(
@@ -400,6 +427,50 @@ class TestPaddingRemoval:
         assert flops_half < flops_full
 
 
+class TestIntervalThroughput:
+    def test_variable_length_interval_uses_sum_of_step_flops(self):
+        args = _make_gpt_args(seq_length=4096)
+        short_step_flops = num_floating_point_operations(
+            args,
+            batch_size=1,
+            total_real_tokens_in_batch=1_000,
+            seqlen_squared_sum_in_batch=2 * 500**2,
+        )
+        long_step_flops = num_floating_point_operations(
+            args,
+            batch_size=1,
+            total_real_tokens_in_batch=4_000,
+            seqlen_squared_sum_in_batch=2 * 2_000**2,
+        )
+        elapsed_time = 14.0
+        world_size = 32
+
+        throughput = training_module._get_model_tflops_per_gpu(
+            args,
+            batch_size=1,
+            elapsed_time=elapsed_time,
+            total_iterations=2,
+            world_size=world_size,
+            interval_floating_point_operations=short_step_flops + long_step_flops,
+            # The boundary step is long; these must not replace interval stats.
+            total_real_tokens_in_batch=4_000,
+            seqlen_squared_sum_in_batch=2 * 2_000**2,
+        )
+        expected = (short_step_flops + long_step_flops) / (elapsed_time * 10**12 * world_size)
+        boundary_step_extrapolation = 2 * long_step_flops / (elapsed_time * 10**12 * world_size)
+
+        assert throughput == pytest.approx(expected)
+        assert throughput != pytest.approx(boundary_step_extrapolation)
+
+    def test_fixed_shape_compatibility_path_extrapolates_one_step(self):
+        args = _make_gpt_args(seq_length=1024)
+        one_step_flops = num_floating_point_operations(args, batch_size=4)
+        throughput = training_module._get_model_tflops_per_gpu(
+            args, batch_size=4, elapsed_time=10.0, total_iterations=5, world_size=8
+        )
+        assert throughput == pytest.approx(one_step_flops * 5 / (10.0 * 10**12 * 8))
+
+
 class TestAccumulator:
     """``update_seqlen_stats_from_cu_seqlens`` and ``consume_seqlen_stats_in_iteration``."""
 
@@ -427,6 +498,43 @@ class TestAccumulator:
         total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
         assert total_real_tokens == 200 + 250
         assert seqlen_squared_sum == 20000 + 42500
+
+    def test_scheduler_global_stats_are_authoritative(self, monkeypatch):
+        """Forward-local metadata cannot overwrite pre-reroute scheduler totals."""
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(training_module.mpu, "model_parallel_is_initialized", lambda: True)
+
+        def unexpected_all_reduce(*args, **kwargs):
+            raise AssertionError("global scheduler stats must not be reduced again")
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", unexpected_all_reduce)
+
+        # A dynamic-CP-style global batch: L=1000 runs on CP1 and L=8000
+        # runs on CP4. These values are calculated before CP replication.
+        training_module.set_seqlen_stats_in_iteration(
+            total_real_tokens=9_000, seqlen_squared_sum=1_000**2 + 8_000**2
+        )
+        # Even if a future entrypoint exposes post-reroute cu_seqlens, it must
+        # not replace the scheduler's authoritative global values.
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 8_000], dtype=torch.int32))
+
+        assert consume_seqlen_stats_in_iteration() == (9_000, 65_000_000)
+
+    def test_reset_discards_a_rejected_attempt(self):
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 100, 300], dtype=torch.int32))
+        training_module.reset_seqlen_stats_in_iteration()
+
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 50, 150], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == (150, 50**2 + 100**2)
+
+    def test_rerun_reset_preserves_scheduler_global_stats(self):
+        training_module.set_seqlen_stats_in_iteration(
+            total_real_tokens=9_000, seqlen_squared_sum=65_000_000
+        )
+
+        training_module.reset_seqlen_stats_in_iteration(preserve_global=True)
+
+        assert consume_seqlen_stats_in_iteration() == (9_000, 65_000_000)
 
     def test_consume_resets_accumulator(self):
         cu = torch.tensor([0, 100, 200], dtype=torch.int32)
@@ -503,13 +611,125 @@ class TestAccumulator:
         assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
 
 
-class TestAccumulatorDistributed:
-    """All-reduce + ``TP*CP*PP`` deduplication.
+class TestAccumulatorVirtualPipeline:
+    def setup_method(self):
+        _reset_seqlen_accumulator()
 
-    Each rank in a DP group sees identical ``cu_seqlens`` (broadcast across model
-    parallelism). The world all-reduce therefore overcounts by ``TP * CP * PP``,
-    which the consume helper divides back out. Run with at least 2 ranks via
-    ``torchrun --nproc_per_node=2``.
+    def teardown_method(self):
+        _reset_seqlen_accumulator()
+
+    @pytest.mark.parametrize("vp_size", [1, 2, 4, 8])
+    def test_logical_microbatch_is_counted_once_for_any_vp_size(self, vp_size):
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        num_microbatches = 3
+
+        for _ in range(num_microbatches):
+            for vp_stage in range(vp_size):
+                _run_forward_stats_update(cu, None if vp_size == 1 else vp_stage)
+
+        assert consume_seqlen_stats_in_iteration() == (
+            num_microbatches * 300,
+            num_microbatches * (100**2 + 200**2),
+        )
+
+    def test_non_primary_virtual_stage_does_not_record(self):
+        _run_forward_stats_update(torch.tensor([0, 100, 300], dtype=torch.int32), vp_stage=2)
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_local_stats_reduce_once_per_optimizer_step(self, monkeypatch):
+        """Microbatches and VPP chunks share one tiny reduction per train step."""
+        dp_group = object()
+        reduced_groups = []
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(training_module.mpu, "model_parallel_is_initialized", lambda: True)
+        monkeypatch.setattr(
+            training_module.mpu,
+            "get_data_parallel_group",
+            lambda with_context_parallel=False: dp_group,
+        )
+        monkeypatch.setattr(training_module, "get_pg_size", lambda group: 2)
+
+        def fake_all_reduce(tensor, *, group):
+            assert group is dp_group
+            reduced_groups.append(group)
+            # Simulate a two-rank DP group with the same local contribution.
+            tensor.mul_(2)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        num_optimizer_steps = 3
+        num_microbatches = 3
+        vp_size = 4
+        expected_per_step = (2 * num_microbatches * 300, 2 * num_microbatches * (100**2 + 200**2))
+
+        for _ in range(num_optimizer_steps):
+            for _ in range(num_microbatches):
+                for vp_stage in range(vp_size):
+                    _run_forward_stats_update(cu, vp_stage)
+            assert consume_seqlen_stats_in_iteration() == expected_per_step
+
+        assert reduced_groups == [dp_group] * num_optimizer_steps
+
+    def test_model_without_vp_stage_is_treated_as_non_interleaved(self):
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+
+        def forward_step(data_iterator, model):
+            update_seqlen_stats_from_cu_seqlens(cu)
+
+        wrapped = training_module._gate_seqlen_stats_by_vp_stage(forward_step)
+        wrapped(None, _ModelWithoutVpStage())
+        assert consume_seqlen_stats_in_iteration() == (300, 100**2 + 200**2)
+
+    def test_vp_stage_is_read_through_model_wrappers(self):
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+
+        def forward_step(data_iterator, model):
+            update_seqlen_stats_from_cu_seqlens(cu)
+
+        model = _FakeModelWrapper(_FakeModelWrapper(_FakeModelChunk(vp_stage=2)))
+        wrapped = training_module._gate_seqlen_stats_by_vp_stage(forward_step)
+        wrapped(None, model)
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_gate_forwards_schedule_arguments(self):
+        seen = []
+
+        def forward_step(data_iterator, model, *args, **kwargs):
+            seen.append((args, kwargs))
+            return "output"
+
+        wrapped = training_module._gate_seqlen_stats_by_vp_stage(forward_step)
+        result = wrapped(None, _FakeModelChunk(0), 0.5, return_schedule_plan=True)
+
+        assert result == "output"
+        assert seen == [((0.5,), {"return_schedule_plan": True})]
+
+    def test_evaluation_forward_does_not_record(self):
+        _run_forward_stats_update(
+            torch.tensor([0, 100, 300], dtype=torch.int32), vp_stage=0, record_stats=False
+        )
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_gate_restores_state_after_an_exception(self):
+        def failing_forward(data_iterator, model):
+            raise RuntimeError("expected failure")
+
+        wrapped = training_module._gate_seqlen_stats_by_vp_stage(
+            failing_forward, record_stats=False
+        )
+        with pytest.raises(RuntimeError, match="expected failure"):
+            wrapped(None, _FakeModelChunk(0))
+        assert training_module._seqlen_stats_recording_enabled is True
+
+
+class TestAccumulatorDistributed:
+    """All-reduce over the pure data-parallel group.
+
+    TP/CP/PP ranks see replicated metadata, so they are excluded from the
+    reduction. Scheduler-provided global stats take a separate zero-collective
+    path. Run with at least 2 ranks via ``torchrun --nproc_per_node=2``.
     """
 
     def setup_method(self):
@@ -541,8 +761,8 @@ class TestAccumulatorDistributed:
         assert total_real_tokens == per_rank_sum * Utils.world_size
         assert seqlen_squared_sum == per_rank_sum_sq * Utils.world_size
 
-    def test_pure_tp_deduplicates(self):
-        """All TP ranks have the same cu_seqlens; deduplication divides the world sum."""
+    def test_pure_tp_has_no_reduction(self):
+        """The pure-DP group has size one when the whole world is TP."""
         from tests.unit_tests.test_utilities import Utils
 
         if Utils.world_size < 2:
@@ -554,11 +774,40 @@ class TestAccumulatorDistributed:
         cu = torch.tensor([0, 100, 300], dtype=torch.int32, device='cuda')
         update_seqlen_stats_from_cu_seqlens(cu)
 
-        # All TP ranks updated the same value; after world all_reduce we get
-        # TP * (per_rank) and divide by TP -> per_rank.
         total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
         assert total_real_tokens == 100 + 200
         assert seqlen_squared_sum == 100**2 + 200**2
+
+    def test_mixed_tp_dp_reduces_only_across_dp(self):
+        from megatron.core import mpu
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size < 4 or Utils.world_size % 2 != 0:
+            pytest.skip("requires an even world size >= 4")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+        )
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+
+        update_seqlen_stats_from_cu_seqlens(
+            torch.tensor([0, 100, 300], dtype=torch.int32, device='cuda')
+        )
+        original_all_reduce = torch.distributed.all_reduce
+        reduced_groups = []
+
+        def spy(tensor, *args, **kwargs):
+            reduced_groups.append(kwargs.get("group"))
+            return original_all_reduce(tensor, *args, **kwargs)
+
+        torch.distributed.all_reduce = spy
+        try:
+            total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        finally:
+            torch.distributed.all_reduce = original_all_reduce
+
+        assert reduced_groups == [dp_group]
+        assert total_real_tokens == 300 * dp_group.size()
+        assert seqlen_squared_sum == (100**2 + 200**2) * dp_group.size()
 
     def test_bshd_path_skips_collective(self):
         """If no rank ever calls ``update_*``, ``consume_*`` must return
@@ -596,8 +845,8 @@ class TestAccumulatorDistributed:
 # three-way combinations that fit in 8 GPUs. This pins the contract that:
 #   - ``cu_seqlens`` is broadcast-replicated across the TP/CP/PP dims (every
 #     rank within one DP group accumulates the same value), and
-#   - ``consume_*`` recovers the global DP-summed value by all-reducing across
-#     the world and dividing by ``TP * CP * PP``.
+#   - ``consume_*`` visits each distinct batch once by reducing only along the
+#     pure data-parallel dimension.
 _TOPOLOGY_8GPU_PARAMS = [
     # (tp, cp, pp)
     pytest.param(1, 1, 1, id="dp8"),
@@ -614,13 +863,10 @@ _TOPOLOGY_8GPU_PARAMS = [
 class TestAccumulatorTopology:
     """End-to-end correctness across the (TP, CP, PP, DP) matrix on 8 GPUs.
 
-    Production invariant: within one DP group all ranks (TP * CP * PP of them)
-    see the SAME ``cu_seqlens`` because it is broadcast across the
-    model-parallel dimensions; across DP groups the data differs. The test
-    simulates that by making every rank's contribution depend ONLY on its DP
-    rank, and asserts the deduplicated global sum matches the closed-form
-    expectation. Catches regressions where any of TP/CP/PP is dropped from the
-    dedup factor.
+    Production invariant: TP/CP/PP peers see the same ``cu_seqlens``, whereas
+    pure-DP peers hold distinct batches. The test makes each DP rank's sequence
+    lengths different and verifies that the pure-DP SUM returns the global
+    values for every model-parallel replica.
 
     Skipped unless launched with ``torchrun --nproc_per_node 8``.
     """
@@ -653,9 +899,8 @@ class TestAccumulatorTopology:
         dp_rank = mpu.get_data_parallel_rank()
 
         # Per-DP-group ``cu_seqlens``: a 2-chunk packed sequence whose lengths
-        # depend on ``dp_rank`` so that every DP group contributes a DIFFERENT
-        # ``sum(L)`` AND ``sum(L^2)``. Every rank in the same DP group must
-        # produce the same value -- that's what the consume() dedup unwinds.
+        # depend on ``dp_rank`` so each pure-DP peer contributes a different
+        # ``sum(L)`` and ``sum(L^2)``.
         len_a = 100 * (dp_rank + 1)
         len_b = 200 * (dp_rank + 1)
         cu = torch.tensor([0, len_a, len_a + len_b], dtype=torch.int32, device='cuda')

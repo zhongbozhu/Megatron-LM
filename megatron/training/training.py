@@ -254,14 +254,16 @@ stimer = StragglerDetector()
 #                               projections, MLP, MoE, MTP, logits)
 #   index 1 -> ``sum_i(L_i**2)`` (used for core-attention FLOPs)
 # Lives on GPU as fp64 so per-micro-batch updates run as fused kernels with
-# no host sync; the only host sync happens once at ``consume`` time after a
-# single 2-element all-reduce. ``_seqlen_stats_active`` flips to ``True`` the
-# first time an update lands this iteration and is the gate that decides
-# whether ``consume_*`` issues a collective at all -- unpacked BSHD runs
-# never call ``update_*`` so the flag stays ``False`` and no collective fires.
+# no host sync; the only host sync happens once at ``consume`` time. Local
+# stats require one 2-element DP reduction, while scheduler-provided global
+# stats require none. ``_seqlen_stats_active`` flips to ``True`` the first time
+# metadata lands this iteration; unpacked BSHD runs leave it ``False``.
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
 _seqlen_stats_are_global: bool = False
+# The pipeline schedule invokes the user forward step once per virtual model
+# chunk. Only the primary chunk may add local metadata for a logical microbatch.
+_seqlen_stats_recording_enabled: bool = True
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
@@ -712,6 +714,22 @@ def print_datetime(string, override_timestamp=None):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
+def reset_seqlen_stats_in_iteration(*, preserve_global=False):
+    """Discard local packed-sequence metadata accumulated for the current attempt.
+
+    A rerun re-executes the same logical batch, so pre-reroute global stats from
+    a sequence-packing scheduler remain valid. Normal consumption clears both
+    local and global state.
+    """
+    global _seqlen_stats_active, _seqlen_stats_are_global
+    if preserve_global and _seqlen_stats_active and _seqlen_stats_are_global:
+        return
+    if _seqlen_stats_in_iteration is not None:
+        _seqlen_stats_in_iteration.zero_()
+    _seqlen_stats_active = False
+    _seqlen_stats_are_global = False
+
+
 def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
 
@@ -722,15 +740,19 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
             metric reports useful work only, not work on CP-alignment or
             end-of-sequence padding tokens.
 
-    Every rank in the same data-parallel group sees the same ``cu_seqlens`` (it is
-    broadcast across TP/CP/PP). The per-micro-batch reduction stays on device --
-    no ``.item()`` -- so this is a fused kernel launch with no host sync. The
-    ``_seqlen_stats_active`` flag is set so that ``consume_*`` knows to issue
-    the all-reduce; BSHD callers that never invoke this function leave the
-    flag at ``False`` and pay zero collective cost.
+    TP/CP/PP peers see replicated ``cu_seqlens`` while pure-DP peers see
+    different microbatches. The per-micro-batch reduction stays on device --
+    no ``.item()`` -- so this is a fused kernel launch with no host sync.
+    Scheduler-provided global stats are authoritative and make this function a
+    no-op; BSHD callers never invoke it and pay zero collective cost.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
-    if cu_seqlens is None or cu_seqlens.numel() < 2:
+    if (
+        not _seqlen_stats_recording_enabled
+        or _seqlen_stats_are_global
+        or cu_seqlens is None
+        or cu_seqlens.numel() < 2
+    ):
         return
     # Pin the accumulator to the current CUDA device when available so the
     # eventual all-reduce can use NCCL even if a caller passed a CPU tensor
@@ -752,12 +774,21 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
 
 
 def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
-    """Seed per-iteration THD FLOPs stats that were already computed globally."""
+    """Set authoritative pre-reroute THD FLOPs stats for the global batch.
+
+    Sequence-packing schedulers calculate these values before samples are
+    replicated or partitioned for context parallelism. Once set, forward-local
+    updates are ignored for the rest of the attempt.
+    """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if total_real_tokens is None or seqlen_squared_sum is None:
         return
     if _seqlen_stats_in_iteration is None:
-        device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() else 'cpu'
+        device = (
+            torch.device(f'cuda:{torch.cuda.current_device()}')
+            if torch.cuda.is_available()
+            else 'cpu'
+        )
         _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
     _seqlen_stats_in_iteration[0] = float(total_real_tokens)
     _seqlen_stats_in_iteration[1] = float(seqlen_squared_sum)
@@ -783,12 +814,10 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         fuse onto one device tensor and consume issues a single 2-element
         all-reduce.
 
-    Sync cost: exactly ONE all-reduce of a 2-element ``float64`` tensor and ONE
-    host sync (``tolist()``). Skipped entirely when the flag is ``False``.
-
-    All ranks within one DP group accumulated identical values (``cu_seqlens`` is
-    replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
-    factor of ``TP * CP * PP``, which we divide out.
+    Locally accumulated stats issue at most one all-reduce of a 2-element
+    ``float64`` tensor over the pure data-parallel group. CP is excluded because
+    CP ranks observe the same sequence metadata. Scheduler-provided global stats
+    skip the collective entirely.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if not _seqlen_stats_active:
@@ -796,26 +825,58 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         # closed-form defaults.
         return None, None
     t = _seqlen_stats_in_iteration
-    if _seqlen_stats_are_global:
-        dedup = 1
-    elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
-        torch.distributed.all_reduce(t)
-        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
-        cp_size = max(mpu.get_context_parallel_world_size(), 1)
-        pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
-        dedup = tp_size * cp_size * pp_size
-    else:
-        # No model-parallel state -> treat as a single rank, no reduction.
-        # This is the standalone unit-test path; production always initializes mpu.
-        dedup = 1
+    if (
+        not _seqlen_stats_are_global
+        and torch.distributed.is_initialized()
+        and mpu.model_parallel_is_initialized()
+    ):
+        # The default includes GTP-remat peers, which hold distinct data, while
+        # excluding CP/TP/PP replicas of the same microbatch metadata.
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+        if get_pg_size(dp_group) > 1:
+            torch.distributed.all_reduce(t, group=dp_group)
     # Single host sync drains both stats at once.
     total_real_tokens, seqlen_squared_sum = t.tolist()
     # Reset for the next iteration. Keep the tensor allocated so subsequent
     # iterations reuse it without reallocating.
-    t.zero_()
-    _seqlen_stats_active = False
-    _seqlen_stats_are_global = False
-    return total_real_tokens / dedup, seqlen_squared_sum / dedup
+    reset_seqlen_stats_in_iteration()
+    return total_real_tokens, seqlen_squared_sum
+
+
+def _get_model_chunk_vp_stage(model) -> Optional[int]:
+    """Return the model chunk's virtual-pipeline stage, if it has one."""
+    try:
+        vp_stage = get_attr_wrapped_model(model, "vp_stage", allow_none=False)
+    except RuntimeError:
+        return None
+    return vp_stage if isinstance(vp_stage, int) else None
+
+
+def _gate_seqlen_stats_by_vp_stage(forward_step_func, *, record_stats=True):
+    """Scope local THD FLOPs accounting to one invocation of a user forward step.
+
+    Interleaved pipelining invokes ``forward_step_func`` once for every virtual
+    model chunk that processes a logical microbatch. The whole-model FLOPs
+    formula must see that microbatch once, so only virtual stage zero records
+    local sequence metadata. Evaluation passes ``record_stats=False`` because
+    its batches must not enter the training accumulator.
+    """
+
+    @functools.wraps(forward_step_func)
+    def wrapper(data_iterator, model, *args, **kwargs):
+        global _seqlen_stats_recording_enabled
+        previous = _seqlen_stats_recording_enabled
+        if record_stats:
+            vp_stage = _get_model_chunk_vp_stage(model)
+            _seqlen_stats_recording_enabled = previous and vp_stage in (None, 0)
+        else:
+            _seqlen_stats_recording_enabled = False
+        try:
+            return forward_step_func(data_iterator, model, *args, **kwargs)
+        finally:
+            _seqlen_stats_recording_enabled = previous
+
+    return wrapper
 
 
 def num_floating_point_operations(
@@ -3088,6 +3149,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     """
     args = get_args()
     timers = get_timers()
+    forward_step_func = _gate_seqlen_stats_by_vp_stage(forward_step_func)
 
     # OTel: set up per-step sub-span support.
     _otel_step_tracer = None
@@ -3107,6 +3169,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        # A rejected attempt is replayed from the same data. Its reporting
+        # metadata must not be added to the successful attempt's totals.
+        reset_seqlen_stats_in_iteration(preserve_global=True)
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -3357,6 +3422,33 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
+def _get_model_tflops_per_gpu(
+    args,
+    batch_size,
+    elapsed_time,
+    total_iterations,
+    world_size,
+    *,
+    interval_floating_point_operations=None,
+    seqlen_squared_sum_in_batch=None,
+    total_real_tokens_in_batch=None,
+):
+    """Calculate throughput over the same interval represented by ``elapsed_time``."""
+    if interval_floating_point_operations is None:
+        # Compatibility path for callers with fixed-shape batches that do not
+        # maintain an exact per-step FLOPs accumulator.
+        interval_floating_point_operations = (
+            num_floating_point_operations(
+                args,
+                batch_size,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+            )
+            * total_iterations
+        )
+    return interval_floating_point_operations / (elapsed_time * 10**12 * world_size)
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3373,6 +3465,7 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    interval_floating_point_operations: float | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3382,8 +3475,9 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    # The first-iteration diagnostic normally does not reset interval state. If
+    # log_interval == 1, however, it is also a regular interval boundary.
+    should_reset = not is_first_iteration or iteration % args.log_interval == 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -3645,12 +3739,16 @@ def training_log(
         elapsed_time_per_iteration = elapsed_time / total_iterations
         llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
-        throughput = num_floating_point_operations(
+        throughput = _get_model_tflops_per_gpu(
             args,
             batch_size,
+            elapsed_time,
+            total_iterations,
+            llm_world_size,
+            interval_floating_point_operations=interval_floating_point_operations,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-        ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
+        )
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -4072,9 +4170,10 @@ def post_training_step_callbacks(
         torch.cuda.synchronize()
 
     # Straggler detector.
-    if iteration % args.log_interval == 0 and args.log_straggler:
-        # Use FLOPs accumulated since last log event and then reset the counter
-        stimer.report(num_floating_point_operations_since_last_log_event, args.log_interval)
+    if iteration % args.log_interval == 0:
+        if args.log_straggler:
+            stimer.report(num_floating_point_operations_since_last_log_event, args.log_interval)
+        # Throughput and straggler reporting consume the same interval.
         num_floating_point_operations_since_last_log_event = 0.0
 
     # Check weight hash across DP replicas.
@@ -5003,6 +5102,9 @@ def train(
                     is_first_iteration=is_first_iteration,
                     seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                     total_real_tokens_in_batch=total_real_tokens_in_batch,
+                    interval_floating_point_operations=(
+                        num_floating_point_operations_since_last_log_event
+                    ),
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5213,6 +5315,9 @@ def evaluate(
     """Evaluation."""
     args = get_args()
     timers = get_timers()
+    # Evaluation may use the same packed entrypoint, but only training batches
+    # contribute to the cumulative training FLOPs counter.
+    forward_step_func = _gate_seqlen_stats_by_vp_stage(forward_step_func, record_stats=False)
 
     timers('evaluate', log_level=0).start(barrier=True)
 
