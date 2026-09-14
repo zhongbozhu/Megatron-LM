@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron optimizer."""
 
@@ -46,6 +46,7 @@ from ..dist_checkpointing.optimizer import (
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
+from ..fp8_utils import copy_back_gathered_bf16_into_mxfp8_params, is_mxfp8tensor
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
@@ -703,6 +704,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         super().__init__(optimizer, config, init_state_fn)
         self.grad_scaler = grad_scaler
 
+        # Tagged True by LayerWiseDistributedOptimizer on its non-DistOpt children.
+        self._layer_wise_non_distopt_child = False
+
         # None grad scaler is only supported for bf16.
         if self.grad_scaler is None:
             assert not self.config.fp16, 'fp16 expects a grad scaler.'
@@ -1159,6 +1163,33 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 model_param.grad = model_param.main_grad
 
     def _copy_main_params_to_model_params(self):
+        # Non-DistOpt LayerWise fp8: route master->model through bf16 (Q(bf16(master))) to match the
+        # fp8-param-gather-OFF baseline (a direct fp32->fp8 copy would write Q(fp32 master)). This
+        # also covers MoE expert weights at expt_dp==1, which are not gathered.
+        if self._layer_wise_non_distopt_child:
+            other_model_data, other_main_data = [], []
+            for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
+                for model_param, main_param in zip(model_group, main_group):
+                    if is_mxfp8tensor(model_param):
+                        # Gathered fp8 params get ``Q(bf16(master))`` written into ``param.data``
+                        # by the fp8 all-gather's requantize (``_allgather_helper_mxfp8``), which
+                        # would overwrite this copy -- so skip it for them. Non-gathered fp8 params
+                        # (e.g. MoE experts at expt_dp == 1, which the all-gather skips) are not
+                        # tagged and still get their ``Q(bf16(master))`` written here.
+                        if not getattr(model_param, '_layer_wise_mxfp8_gathered', False):
+                            copy_back_gathered_bf16_into_mxfp8_params(
+                                [model_param], [main_param.detach().to(torch.bfloat16)]
+                            )
+                    else:
+                        other_model_data.append(model_param.data)
+                        other_main_data.append(main_param.data)
+            if other_model_data:
+                _multi_tensor_copy_this_to_that(
+                    this=other_main_data,
+                    that=other_model_data,
+                    overflow_buf=self._dummy_overflow_buf,
+                )
+            return
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
         _multi_tensor_copy_this_to_that(
@@ -1727,6 +1758,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 optimizer.prepare_model_params_for_param_sync()
 
         for model_chunk in model_chunks:
+            model_chunk.finish_pending_param_sync()
             model_chunk.zero_grad_buffer()
         for optimizer in dist_optimizers:
             if not getattr(optimizer, 'is_stub_optimizer', False):

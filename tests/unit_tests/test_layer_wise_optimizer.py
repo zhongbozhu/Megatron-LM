@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -10,9 +12,11 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
-from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+from megatron.core.optimizer.optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
@@ -107,6 +111,63 @@ def test_set_bucket_layerwise_params_list_single_dp_rank():
     assert bucket.layerwise_param_flat_sizes == [sum(param.numel() for param in params)]
 
 
+def test_finish_pending_param_sync_only_finishes_existing_gathers():
+    """Do not launch new collectives while preparing reused parameter storage."""
+    pending_dense = Mock(param_gather_handle=object())
+    pending_expert = Mock(param_gather_handle=object())
+    idle = Mock(param_gather_handle=None)
+    model = SimpleNamespace(
+        bucket_groups=[pending_dense, idle], expert_parallel_bucket_groups=[pending_expert]
+    )
+
+    DistributedDataParallel.finish_pending_param_sync(model)
+
+    pending_dense.start_param_sync.assert_called_once_with(force_sync=True)
+    pending_expert.start_param_sync.assert_called_once_with(force_sync=True)
+    idle.start_param_sync.assert_not_called()
+
+
+def test_force_sync_finalizes_pending_gather_before_reusing_storage():
+    """A force-sync must consume the old payload, not dispatch another gather."""
+    events = Mock()
+    group = object.__new__(_ParamAndGradBucketGroup)
+    group.param_sync_via_bucket_group = True
+    group.param_gather_handle = events.work
+    group._finalize_layerwise_param_sync = events.copy_back
+    group._post_param_sync = events.post_process
+
+    group.start_param_sync(force_sync=True)
+
+    assert events.mock_calls == [call.work.wait(), call.copy_back(), call.post_process()]
+    assert group.param_gather_handle is None
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_prepare_reused_param_buffer_finishes_gather_before_zeroing(chained):
+    """Both optimizer entrypoints must drain a shared buffer before clearing it."""
+    events = Mock()
+    model = SimpleNamespace(
+        finish_pending_param_sync=events.finish_pending, zero_grad_buffer=events.zero_grad
+    )
+    dist_optimizer = object.__new__(DistributedOptimizer)
+    dist_optimizer.config = SimpleNamespace(
+        reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
+    )
+    dist_optimizer.is_stub_optimizer = False
+    dist_optimizer.model_chunks = [model]
+    dist_optimizer._copy_main_params_to_param_buffer = events.stage
+    if chained:
+        optimizer = object.__new__(ChainedOptimizer)
+        optimizer.config = dist_optimizer.config
+        optimizer.chained_optimizers = [dist_optimizer]
+    else:
+        optimizer = dist_optimizer
+
+    optimizer.prepare_model_params_for_param_sync()
+
+    assert events.mock_calls == [call.finish_pending(), call.zero_grad(), call.stage()]
+
+
 class MuonExcludedMatrixModel(nn.Module):
     """Model with a 2D matrix explicitly routed to the scalar optimizer."""
 
@@ -152,11 +213,9 @@ class TestLayerWiseOptimizer:
             model_kwargs: Optional kwargs for model initialization
             use_layer_wise: If True, use LayerWiseDistributedOptimizer via dist_muon;
                           if False, use standard muon ChainedOptimizer (for reference)
-            use_param_layout: If True, supply DDP a precomputed shard-aligned
-                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
-                + ``start_param_sync``). If False (default), build DDP without a layout
-                so ``LayerWiseDistributedOptimizer`` syncs via the legacy
-                flatten / ``all_gather_v`` / unflatten ``allgather_params()`` codepath.
+            use_param_layout: If True, use a shard-aligned padded LayerWise layout.
+                If False (default), use a compact LayerWise layout. Adam parameters use
+                their own byte-level DistributedOptimizer buffers in both cases.
 
         Returns:
             tuple: (model, optimizer, pg_collection)
@@ -167,21 +226,15 @@ class TestLayerWiseOptimizer:
         model = model_class(**model_kwargs).bfloat16().cuda()
         model.requires_grad_(True)
 
-        if use_param_layout:
-            from megatron.training.training import wrap_model_chunks_with_ddp
+        from megatron.training.training import wrap_model_chunks_with_ddp
 
-            ddp_config = DistributedDataParallelConfig()
-            model = wrap_model_chunks_with_ddp(
-                [model],
-                TransformerConfig(num_attention_heads=1, num_layers=1),
-                ddp_config,
-                use_layer_wise_distributed_optimizer=use_layer_wise,
-            )[0]
-        else:
-            ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-            model = DistributedDataParallel(
-                TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-            )
+        ddp_config = DistributedDataParallelConfig(use_layer_wise_param_layout=use_param_layout)
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config,
+            use_layer_wise_distributed_optimizer=use_layer_wise,
+        )[0]
         if copy_from:
             model.module.load_state_dict(copy_from.module.state_dict())
         else:
@@ -196,6 +249,7 @@ class TestLayerWiseOptimizer:
             clip_grad=clip_grad,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=use_layer_wise,
+            use_layer_wise_param_layout=use_param_layout,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -235,9 +289,8 @@ class TestLayerWiseOptimizer:
                 verify that the DDP config remains authoritative. Defaults to the DDP value.
             grad_reduce_in_fp32: If True, reduce grads in fp32 (regression test for dtype fix)
             bucket_size: Maximum number of parameters per bucket (None = single bucket)
-            use_param_layout: If True, supply DDP a precomputed shard-aligned
-                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
-                + ``start_param_sync``). If False (default), build DDP without a layout.
+            use_param_layout: If True, use shard-aligned padding for LayerWise buffers;
+                if False (default), use a compact layout. Adam ownership is unchanged.
 
         Returns:
             tuple: (model, optimizer, pg_collection)
@@ -253,32 +306,21 @@ class TestLayerWiseOptimizer:
         # the two so a caller only has to flip one.
         overlap_grad_reduce = overlap_param_gather
 
-        if use_param_layout:
-            from megatron.training.training import wrap_model_chunks_with_ddp
+        from megatron.training.training import wrap_model_chunks_with_ddp
 
-            ddp_config = DistributedDataParallelConfig(
-                overlap_param_gather=overlap_param_gather,
-                overlap_grad_reduce=overlap_grad_reduce,
-                grad_reduce_in_fp32=grad_reduce_in_fp32,
-                bucket_size=bucket_size,
-            )
-            model = wrap_model_chunks_with_ddp(
-                [model],
-                TransformerConfig(num_attention_heads=1, num_layers=1),
-                ddp_config,
-                use_layer_wise_distributed_optimizer=True,
-            )[0]
-        else:
-            ddp_config = DistributedDataParallelConfig(
-                use_distributed_optimizer=False,
-                overlap_param_gather=overlap_param_gather,
-                overlap_grad_reduce=overlap_grad_reduce,
-                grad_reduce_in_fp32=grad_reduce_in_fp32,
-                bucket_size=bucket_size,
-            )
-            model = DistributedDataParallel(
-                TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-            )
+        ddp_config = DistributedDataParallelConfig(
+            use_layer_wise_param_layout=use_param_layout,
+            overlap_param_gather=overlap_param_gather,
+            overlap_grad_reduce=overlap_grad_reduce,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            bucket_size=bucket_size,
+        )
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config,
+            use_layer_wise_distributed_optimizer=True,
+        )[0]
         if copy_from:
             model.module.load_state_dict(copy_from.module.state_dict())
         else:
@@ -297,6 +339,7 @@ class TestLayerWiseOptimizer:
             overlap_param_gather=optimizer_overlap_param_gather,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=use_param_layout,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -531,14 +574,23 @@ class TestLayerWiseOptimizer:
 
         assert update_successful, "Optimizer step should be successful"
 
-    def test_bf16_wrapping(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_bf16_wrapping(self, use_param_layout):
         """Test LayerWiseDistributedOptimizer automatically wraps optimizer with bf16."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer()
+        model, optimizer, pg_collection = self.create_model_and_optimizer(
+            use_param_layout=use_param_layout
+        )
 
         # Verify bf16 wrapping happened
-        assert isinstance(
-            optimizer.chained_optimizers[0], Float16OptimizerWithFloat16Params
-        ), "Optimizer should be wrapped in Float16OptimizerWithFloat16Params"
+        layer_wise_optimizer = next(
+            child
+            for child in optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        assert all(
+            isinstance(child, Float16OptimizerWithFloat16Params)
+            for child in layer_wise_optimizer.chained_optimizers
+        ), "LayerWise children should be wrapped in Float16OptimizerWithFloat16Params"
 
         for param in model.parameters():
             param.grad = torch.randn_like(param)
@@ -695,8 +747,15 @@ class TestLayerWiseOptimizer:
 
         assert params_updated > 0, "At least some parameters should be updated"
 
-        # step() internal call allgather_params. replace reference object with bcast
-        reference_optimizer.allgather_params = reference_optimizer.broadcast_params
+        # Replace only Muon's compact gather; the Adam sibling retains its DistOpt sync.
+        reference_layer_wise_optimizer = next(
+            child
+            for child in reference_optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        reference_layer_wise_optimizer.allgather_params = (
+            reference_layer_wise_optimizer.broadcast_params
+        )
         reference_optimizer.step()
 
         # Verify updated values match reference optimizer
@@ -881,6 +940,9 @@ class TestLayerWiseOptimizer:
 
         for bucket_group in model.bucket_groups:
             for bucket in bucket_group.buckets:
+                if not getattr(bucket.params_list[0], 'is_managed_by_layer_wise_optimizer', False):
+                    assert bucket.layerwise_params_list is None
+                    continue
                 # layerwise_params_list should be populated by set_bucket_layerwise_params_list
                 assert (
                     bucket.layerwise_params_list is not None
@@ -1013,8 +1075,15 @@ class TestLayerWiseOptimizer:
 
         assert params_updated > 0, "At least some parameters should be updated"
 
-        # step() internally calls allgather_params. Replace reference with broadcast.
-        reference_optimizer.allgather_params = reference_optimizer.broadcast_params
+        # Replace only Muon's compact gather; the Adam sibling retains its DistOpt sync.
+        reference_layer_wise_optimizer = next(
+            child
+            for child in reference_optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        reference_layer_wise_optimizer.allgather_params = (
+            reference_layer_wise_optimizer.broadcast_params
+        )
         reference_optimizer.step()
 
         # Verify updated values match reference optimizer

@@ -1,12 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""GTP + MXFP8 --fp8-param-gather / --reuse-grad-buf-for-mxfp8-param-ag correctness.
+"""Native-MXFP8 synchronization, layout parity, and checkpoint regressions for GTP.
 
-Asserts the two MXFP8 param-gather knobs don't change training: a GTP (weight-remat=2) loss
-trajectory with the knobs on must match the same run with them off. Reuses the full DDP +
-DistributedOptimizer harness from ``test_fp8_param.py::TestFP8Param`` by composition (imported
-under a non-``Test*`` alias so pytest doesn't re-collect it), flipping GTP on via
-``tensor_parallel_num_weight_shards`` (= tp x gtp_weight_remat_size).
+GTP with MXFP8 requires parameter gather and gradient-buffer reuse. These cases
+check forward-weight updates and layout parity with both enabled; the existing
+dense/MoE loss references instead use pure BF16 compute. Same-recipe gather
+ON/OFF comparisons below run with weight rematerialization disabled.
+The shared DDP harness enables GTP through ``tensor_parallel_num_weight_shards``.
 """
 
 import math
@@ -19,7 +19,7 @@ from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
-from megatron.core.fp8_utils import dequantize_fp8_tensor, is_mxfp8tensor
+from megatron.core.fp8_utils import dequantize_fp8_tensor, is_float8tensor, is_mxfp8tensor
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
@@ -45,7 +45,11 @@ from megatron.training.utils import get_device_arch_version
 # Non-"Test*" alias so pytest does not re-collect the whole TestFP8Param suite here (wrong
 # world/DP config + global-state pollution); reused by composition only.
 from tests.unit_tests.test_fp8_param import TestFP8Param as _FP8ParamHarness
-from tests.unit_tests.test_fp8_param import fp8_available, reason_for_no_fp8
+from tests.unit_tests.test_fp8_param import (
+    _assert_param_storage_policy,
+    fp8_available,
+    reason_for_no_fp8,
+)
 from tests.unit_tests.test_utilities import Utils
 
 HAVE_FLA_SEQUENCE_PACKING, FLA_SEQUENCE_PACKING_REASON = check_fla_sequence_packing_support()
@@ -54,7 +58,7 @@ HAVE_GDP_DEPS = all(
 )
 
 
-def _gdp_moe_test_args(overlap, *, num_weight_shards):
+def _gdp_moe_test_args(overlap, *, num_weight_shards, use_layer_wise_param_layout):
     """Return the shared real-GDP + grouped-MoE training configuration."""
 
     return dict(
@@ -69,9 +73,8 @@ def _gdp_moe_test_args(overlap, *, num_weight_shards):
         num_attention_heads=8,
         ffn_hidden_size=256,
         normalization="RMSNorm",
-        # Keep d_inner=256 while making GDP's logical in-proj/dgrad K
-        # 4 * (d_inner + groups * state_dim + heads) = 2080, which is
-        # divisible by the MXFP8 block size (32). GTP storage remains padded when enabled.
+        # Keep d_inner=256 and in-proj width4*(256+2*128+8)=2080,
+        # divisible by MXFP8's 32-element block size.
         mamba_num_heads=8,
         mamba_head_dim=32,
         mamba_num_groups=2,
@@ -88,6 +91,7 @@ def _gdp_moe_test_args(overlap, *, num_weight_shards):
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
         moe_router_pre_softmax=True,
+        moe_router_skip_muon=False,
         moe_router_load_balancing_type="none",
         moe_aux_loss_coeff=0.0,
         add_bias_linear=False,
@@ -102,7 +106,7 @@ def _gdp_moe_test_args(overlap, *, num_weight_shards):
         clip_grad=0.0,
         global_batch_size=4,
         tensor_parallel_num_weight_shards=num_weight_shards,
-        use_layer_wise_param_layout=True,
+        use_layer_wise_param_layout=use_layer_wise_param_layout,
         untie_embeddings_and_output_weights=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -137,22 +141,20 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         return matches[0]
 
     def _on_model_built(self, model_chunks, optimizer, args):
-        assert args.use_layer_wise_param_layout
+        assert isinstance(args.use_layer_wise_param_layout, bool)
         assert args.expert_gtp_weight_remat_size == 1
         gtp_enabled = args.gtp_weight_remat_size > 1
-        native_mxfp8 = args.fp8_param_gather
+        native_fp8 = args.fp8_param_gather
         assert args.fp8_recipe == "mxfp8"
         assert args.fp8 is not None
         if gtp_enabled:
-            assert native_mxfp8, "GTP with the MXFP8 recipe requires FP8 parameter gather"
-        if native_mxfp8:
-            assert args.reuse_grad_buf_for_mxfp8_param_ag
-        else:
-            assert not args.reuse_grad_buf_for_mxfp8_param_ag
+            assert native_fp8, "GTP with the MXFP8 recipe requires FP8 parameter gather"
+        assert args.reuse_grad_buf_for_mxfp8_param_ag == native_fp8
         assert args.muon_scalar_optimizer == "adam"
         assert optimizer.config.decoupled_weight_decay, "Scalar Adam must use AdamW semantics"
 
         model = model_chunks[0]
+        _assert_param_storage_policy(model, args)
         core_model = unwrap_model(model)
         assert core_model.decoder.layer_type_list == ["M", "E"]
 
@@ -164,9 +166,11 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         in_proj_width = (1 + gdp.num_householder) * (
             gdp.d_inner + gdp.ngroups * gdp.d_state + gdp.nheads
         )
-        assert (
-            in_proj_width % 32 == 0
-        ), f"GDP in-proj width {in_proj_width} is incompatible with MXFP8's 32-element blocks"
+        block_size = 32
+        assert in_proj_width % block_size == 0, (
+            f"GDP in-proj width {in_proj_width} is incompatible with "
+            f"{args.fp8_recipe}'s {block_size}-element blocks"
+        )
         in_proj = gdp.in_proj.weight
         out_proj = gdp.out_proj.weight
 
@@ -174,6 +178,11 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         expert_name = "decoder.layers.1.mlp.experts.linear_fc1.weight0"
         assert expert_name in named_params, f"Missing grouped-MoE parameter {expert_name}"
         expert_weight = named_params[expert_name]
+        router_weight = named_params["decoder.layers.1.mlp.router.weight"]
+        assert not is_float8tensor(router_weight)
+        assert getattr(
+            router_weight, "is_managed_by_layer_wise_optimizer", False
+        ), "GDP integration must retain a high-precision Muon router alongside FP8 matrices"
 
         # These are production attributes: the test does not inject optimizer routing.
         assert getattr(in_proj, "use_muon", True) is False
@@ -195,9 +204,11 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
             ("GDP out_proj", out_proj),
             ("MoE expert", expert_weight),
         ):
-            assert (
-                is_mxfp8tensor(param) == native_mxfp8
-            ), f"{label} storage does not match fp8_param_gather={args.fp8_param_gather}"
+            is_recipe_tensor = is_mxfp8tensor(param)
+            assert is_recipe_tensor == native_fp8, (
+                f"{label} storage does not match recipe={args.fp8_recipe}, "
+                f"fp8_param_gather={args.fp8_param_gather}"
+            )
 
         layerwise_optimizers = [
             child
@@ -233,10 +244,13 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         in_proj_buffer = self._find_buffer(model, in_proj)
         out_proj_buffer = self._find_buffer(model, out_proj)
         expert_buffer = self._find_buffer(model, expert_weight)
-        expected_buffer_dtype = torch.uint8 if native_mxfp8 else torch.bfloat16
-        assert in_proj_buffer.param_dtype == expected_buffer_dtype
-        assert out_proj_buffer.param_dtype == expected_buffer_dtype
-        assert expert_buffer.param_dtype == expected_buffer_dtype
+        expected_adam_dtype = torch.uint8 if native_fp8 else torch.bfloat16
+        expected_muon_dtype = (
+            expected_adam_dtype if args.use_layer_wise_param_layout else torch.bfloat16
+        )
+        assert in_proj_buffer.param_dtype == expected_adam_dtype
+        assert out_proj_buffer.param_dtype == expected_muon_dtype
+        assert expert_buffer.param_dtype == expected_muon_dtype
         assert (
             in_proj_buffer is not out_proj_buffer
         ), "AdamW GDP in_proj and Muon GDP out_proj require distinct DDP buffers"
@@ -331,7 +345,7 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
 
 
 class TestGTPFp8ParamGather:
-    """MXFP8 parameter-gather tests, including GTP and exact same-recipe parity."""
+    """MXFP8 GTP synchronization and grouped-expert layout regressions."""
 
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
@@ -461,7 +475,8 @@ class TestGTPFp8ParamGather:
         ),
     )
     @pytest.mark.parametrize("overlap", [False, True])
-    def test_gtp_gdp_adamw_moe_muon_mxfp8_sync(self, overlap):
+    @pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
+    def test_gtp_gdp_adamw_moe_muon_mxfp8_sync(self, overlap, use_layer_wise_param_layout):
         """GTP2 GDP-AdamW + MoE-Muon MXFP8 weights must update and stay synchronized."""
         if Utils.world_size != 4:
             pytest.skip("Requires exactly 4 torchrun ranks for GTP2 x DP2 and EP2 x EDP2")
@@ -474,7 +489,11 @@ class TestGTPFp8ParamGather:
             losses = harness._run_test_helper(
                 recipe="mxfp8",
                 fp8_param_gather=True,
-                **_gdp_moe_test_args(overlap, num_weight_shards=2),
+                **_gdp_moe_test_args(
+                    overlap,
+                    num_weight_shards=2,
+                    use_layer_wise_param_layout=use_layer_wise_param_layout,
+                ),
             )
             assert harness._runtime_validation_ran
 
@@ -501,10 +520,10 @@ class TestGTPFp8ParamGather:
     )
     @pytest.mark.parametrize("overlap", [False, True])
     def test_muon_layout_and_mxfp8_param_gather_parity(self, overlap):
-        """Padded LayerWise MXFP8 sync must match the legacy LayerWise path.
+        """Padded LayerWise MXFP8 sync must match the compact LayerWise path.
 
         Both runs are configured with Muon, GTP2 x DP2, MXFP8 primary weights,
-        FP8 parameter gather, and grad-buffer reuse. The legacy LayerWise gather
+        FP8 parameter gather, and grad-buffer reuse. The compact LayerWise gather
         is the oracle; the padded-layout run exercises the reused DDP grad buffer
         and is the regression target. Overlap selects synchronous step-time gather
         or asynchronous dispatch from the next forward pre-hook.
@@ -540,7 +559,7 @@ class TestGTPFp8ParamGather:
                 overlap_grad_reduce=overlap,
             )
 
-            loss_legacy = harness._run_test_helper(
+            loss_compact = harness._run_test_helper(
                 tp_size=1,
                 recipe="mxfp8",
                 fp8_param_gather=True,
@@ -555,7 +574,7 @@ class TestGTPFp8ParamGather:
                 **common,
             )
 
-            max_diff = torch.tensor(float((loss_legacy - loss_padded).abs().max()), device="cuda")
+            max_diff = torch.tensor(float((loss_compact - loss_padded).abs().max()), device="cuda")
             # Compare the worst local GTP/DP trajectory, rather than rank 0 alone.
             # Map local non-finite values before MAX so NCCL cannot hide a NaN from one rank.
             max_diff.nan_to_num_(nan=float('inf'), posinf=float('inf'), neginf=float('inf'))
@@ -563,7 +582,7 @@ class TestGTPFp8ParamGather:
             diff = max_diff.item()
             tolerance = 2e-3
             assert math.isfinite(diff) and diff < tolerance, (
-                f"Padded LayerWise MXFP8 loss diverges from the legacy path "
+                f"Padded LayerWise MXFP8 loss diverges from the compact path "
                 f"(overlap={overlap}, max per-step |diff|={diff:.6f}, tolerance={tolerance})."
             )
         finally:
@@ -668,9 +687,7 @@ class TestGTPFp8ParamGather:
             harness.teardown_method(None)
 
     @pytest.mark.launch_on_gb200
-    @pytest.mark.skipif(
-        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
-    )
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(
         not HAVE_EMERGING_OPTIMIZERS, reason="emerging-optimizers package is required"
@@ -682,17 +699,20 @@ class TestGTPFp8ParamGather:
         ),
     )
     @pytest.mark.parametrize("overlap", [False, True])
-    def test_gdp_adamw_moe_muon_mxfp8_param_gather(self, overlap, monkeypatch):
+    @pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
+    def test_gdp_adamw_moe_muon_mxfp8_param_gather(
+        self, overlap, use_layer_wise_param_layout, monkeypatch
+    ):
         """GDP-AdamW + MoE-Muon must agree with MXFP8 parameter gather ON and OFF.
 
         ``ME`` builds a GDP mixer followed by a grouped-MoE layer. GDP itself marks its
         ``in_proj.weight`` ``use_muon=False``, which routes it to scalar AdamW; GDP ``out_proj``
-        and the two-dimensional expert weights remain on LayerWise/Muon. The padded layout then
-        creates separate AdamW-owned and Muon-owned buffers. For each overlap mode, the native
-        MXFP8 parameter-gather/reuse trajectory must remain close to the same model using BF16
-        primary weights, while both runs use the same MXFP8 compute recipe. In particular, the
+        and the two-dimensional expert weights remain on LayerWise/Muon. Both layouts
+        create separate AdamW-owned and Muon-owned buffers. For each overlap mode, the native
+        FP8 parameter-gather/reuse trajectory must remain close to the same model using BF16
+        primary weights, while both runs use the same compute recipe. In particular, the
         first post-update loss verifies that LayerWise/Muon initialized its FP32 masters from
-        TE's preserved high-precision values instead of dequantized MXFP8 weights.
+        TE's preserved high-precision values instead of dequantized FP8 weights.
 
         Weight rematerialization is intentionally disabled: active GTP requires MXFP8 parameter
         gather and cannot form this exact ON/OFF comparison. The original reused-grad-buffer bug
@@ -700,6 +720,8 @@ class TestGTPFp8ParamGather:
         """
         if Utils.world_size != 4:
             pytest.skip("Requires exactly 4 torchrun ranks for DP4 and EP2 x EDP2")
+        if get_device_arch_version() < 10:
+            pytest.skip("mxfp8 requires Blackwell architecture or newer")
 
         # GDP's channels-last causal-conv backward normally accumulates dweight with atomicAdd.
         # Its launch-order-dependent rounding becomes visible when gradient reduce is overlapped,
@@ -713,7 +735,11 @@ class TestGTPFp8ParamGather:
         harness.seq_length = 128
         harness.micro_batch_size = 1
         try:
-            common = _gdp_moe_test_args(overlap, num_weight_shards=1)
+            common = _gdp_moe_test_args(
+                overlap,
+                num_weight_shards=1,
+                use_layer_wise_param_layout=use_layer_wise_param_layout,
+            )
 
             loss_fp8_param_gather_on = harness._run_test_helper(
                 recipe="mxfp8", fp8_param_gather=True, **common
@@ -748,8 +774,9 @@ class TestGTPFp8ParamGather:
             diff = per_rank_step_diff[worst_rank, worst_step].item()
             tolerance = allowed_diff[worst_rank, worst_step].item()
             assert torch.isfinite(trajectories).all() and diff <= tolerance, (
-                "GDP-AdamW + MoE-Muon loss differs with MXFP8 parameter gather ON versus OFF "
-                f"(overlap={overlap}, |diff|={diff:.6f}, allowed={tolerance:.6f}, "
+                "GDP-AdamW + MoE-Muon loss differs with FP8 parameter gather ON versus OFF "
+                f"(recipe=mxfp8, layout={use_layer_wise_param_layout}, overlap={overlap}, "
+                f"|diff|={diff:.6f}, allowed={tolerance:.6f}, "
                 f"atol={atol}, rtol={rtol}, worst_rank={worst_rank}, "
                 f"worst_step={worst_step}; fp8-param-gather-ON: "
                 f"{trajectories[worst_rank, 0].tolist()}, fp8-param-gather-OFF: "

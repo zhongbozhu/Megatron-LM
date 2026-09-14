@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -41,7 +41,6 @@ from megatron.training.utils import (
     update_use_dist_ckpt,
     warn_rank_0,
 )
-
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -697,7 +696,7 @@ def validate_args(args, defaults={}):
         for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) or \
             args.per_split_data_args_path is not None
     if use_per_split_data_path:
-         # Exactly one of the two has to be None if we use it.
+        # Exactly one of the two has to be None if we use it.
         assert any(elt is not None
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
@@ -1528,7 +1527,6 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
-
     # Derive the internal gtp_weight_remat_size from the user-facing
     # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
     # from argument generation), so it is set here as a fresh attribute on args before it is
@@ -1827,8 +1825,13 @@ def validate_args(args, defaults={}):
             args.use_distributed_optimizer = False
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        assert (
+            not args.use_megatron_fsdp
+        ), "Emerging optimizer does not support Megatron-FSDP for now."
+        assert args.ckpt_format in [
+            "torch",
+            "torch_dist",
+        ], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     assert not (
         args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight
@@ -1837,6 +1840,28 @@ def validate_args(args, defaults={}):
         "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
         "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
     )
+
+    if args.use_layer_wise_distributed_optimizer:
+        # MXFP8 transport is independent of the padded/compact LayerWise buffer layout.
+        # Gather BF16 values staged in grad storage, then quantize locally.
+        assert not getattr(args, 'fp4_param_gather', False), (
+            "The LayerWise distributed optimizer supports MXFP8 parameter gather only; "
+            "fp4_param_gather is not supported."
+        )
+        if args.fp8_param_gather:
+            assert args.fp8_recipe == 'mxfp8', (
+                "LayerWise fp8 parameter gather requires "
+                f"fp8_recipe='mxfp8'; got {args.fp8_recipe!r}."
+            )
+            assert args.reuse_grad_buf_for_mxfp8_param_ag, (
+                "LayerWise mxfp8 + --fp8-param-gather requires "
+                "--reuse-grad-buf-for-mxfp8-param-ag."
+            )
+        assert args.num_distributed_optimizer_instances == 1, (
+            "The LayerWise distributed optimizer requires "
+            "num_distributed_optimizer_instances == 1: Muon and sibling Adam buffers "
+            "do not support multiple distributed optimizer instances."
+        )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -3315,17 +3340,6 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
-    group.add_argument('--no-use-layer-wise-param-layout',
-                       action='store_false',
-                       dest='use_layer_wise_param_layout',
-                       help='Opt out of the precomputed LayerWise param layout. When set, '
-                       'falls back to the legacy LayerWise ping-pong path: all params '
-                       '(including non-Muon embeddings, biases, layernorm) live in a single '
-                       'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
-                       'The default (precomputed layout) routes non-Muon params through a '
-                       'separate DistributedOptimizer with byte-level sharding, which is faster '
-                       'and uses less padding but produces different bf16 reduction ordering '
-                       'and so will not match legacy-path loss curves bit-for-bit.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'
@@ -3408,6 +3422,18 @@ def _add_distributed_args(parser):
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
+    group.add_argument(
+        '--no-use-layer-wise-param-layout',
+        action='store_false',
+        dest='use_layer_wise_param_layout',
+        default=True,
+        help='Disable shard-aligned padding for LayerWise (Muon) buffers and use a compact '
+        'layout with all-reduce gradients and whole-parameter all-gather instead. '
+        'Sibling Adam parameters retain the byte-level DistributedOptimizer in either layout. '
+        'FP8 staging-buffer reuse is independent of this choice. '
+        'The layouts use different bf16 reduction orderings, so they are not bit-for-bit '
+        'comparable with each other.',
+    )
     return parser
 
 

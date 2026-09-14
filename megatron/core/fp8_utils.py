@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
@@ -306,6 +306,42 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.dequantize()
     else:
         return fp8_tensor.from_float8()
+
+
+def copy_back_gathered_bf16_into_mxfp8_params(
+    model_params: List[torch.Tensor], srcs_bf16: List[torch.Tensor]
+) -> None:
+    """Copy BF16 whole-parameter values into LayerWise forward weights.
+
+    Plain BF16 parameters are allowed because a LayerWise bucket can contain BF16 siblings of
+    supported FP8 parameters. Quantized destinations are limited to MXFP8 tensors.
+    MXFP8 columnwise data cannot be derived from rowwise data, so force both usages before the
+    batched quantized copy. Validate the entire batch before mutating any quantizer usage.
+    """
+    if len(model_params) != len(srcs_bf16):
+        raise ValueError(
+            "LayerWise FP8 parameter gather copy-back requires one source per parameter: "
+            f"got {len(model_params)} parameters and {len(srcs_bf16)} sources."
+        )
+
+    mxfp8_quantizers = []
+    for model_p in model_params:
+        if is_grouped_tensor_with_quantized_storage(model_p):
+            raise TypeError(
+                "LayerWise FP8 parameter gather does not support Transformer Engine "
+                "GroupedTensor quantized storage. Disable --moe-single-grouped-weight."
+            )
+        if is_float8tensor(model_p) and not is_mxfp8tensor(model_p):
+            raise TypeError(
+                "LayerWise FP8 parameter gather supports only MXFP8Tensor destinations."
+            )
+        if is_mxfp8tensor(model_p):
+            mxfp8_quantizers.append(model_p.data._get_quantizer())
+
+    for quantizer in mxfp8_quantizers:
+        quantizer.set_usage(rowwise=True, columnwise=True)
+
+    copy_tensors_to_quantized_params(model_params, srcs_bf16)
 
 
 def _resolve_callable_from_python_import_path(dotted_path: str):

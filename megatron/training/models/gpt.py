@@ -368,8 +368,10 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-                controls whether to compute and supply a shard-aligned param layout to DDP.
+            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``, selects the
+                DDP layout for LayerWise-managed buffers: True (default) for shard-aligned padding,
+                or False for a compact layout. Adam buffers use the standard DistributedOptimizer
+                layout in both cases.
 
         Returns:
             List of model stages.

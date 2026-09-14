@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import weakref
@@ -188,8 +188,14 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
-        buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel). fp8 params key to
+        # uint8 (own buffer); partition_buckets later merges the small non-fp8 bucket groups into
+        # the fp8 group to aggregate their communication.
+        buffer_groups = group_params_for_buffers(
+            all_params,
+            self.ddp_config.grad_reduce_in_fp32,
+            merge_layerwise_mxfp8_grads=not self.ddp_config.use_layer_wise_param_layout,
+        )
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
@@ -667,6 +673,13 @@ class DistributedDataParallel(_BaseDataParallel):
                 "parameter all-gather is still in flight."
             )
             bucket_group.param_gather_dispatched = False
+
+    def finish_pending_param_sync(self) -> None:
+        """Finish existing gathers before their gradient storage is cleared or restaged."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            if bucket_group.param_gather_handle is not None:
+                # force_sync finalizes the pending handle without launching another collective.
+                bucket_group.start_param_sync(force_sync=True)
 
     @_otel_trace_fn('communication', 'megatron.grad_sync.start')
     def start_grad_sync(self, *unused):

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -38,6 +38,17 @@ class DistributedDataParallelConfig:
     num_distributed_optimizer_instances: int = 1
     """Sets the factor by which the DP domain is sharded to have the partial DistOpt
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
+    """
+
+    use_layer_wise_param_layout: bool = True
+    """Layer-wise (Muon) optimizer only; ignored otherwise.
+
+       If true, LayerWise-managed buffers use a shard-aligned padded layout with
+       reduce-scatter gradients and fixed-size parameter all-gather. If false, they use
+       a compact layout with all-reduce gradients and whole-parameter all-gather.
+       In both cases, sibling buffers (embeddings, biases, layernorm, and excluded matrices)
+       retain the byte-level ``DistributedOptimizer`` layout. FP8 staging-buffer reuse is
+       independent of this layout choice.
     """
 
     check_for_nan_in_grad: bool = False
@@ -294,8 +305,8 @@ class DistributedDataParallelConfig:
         if self.use_distributed_optimizer:
             return True
 
-        # When standard DistOpt is disabled, these flags select the legacy LayerWise
-        # bucket-group path: forward-scheduled overlap or synchronous grad-buffer reuse.
+        # For compact LayerWise buffers, these flags select forward-scheduled overlap or
+        # synchronous MXFP8 reuse.
         return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
 
     def __post_init__(self):

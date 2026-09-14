@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron distributed optimizer."""
 
@@ -624,7 +624,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Returns:
             FullParamLayout with a PerBufferParamLayout per buffer group.
         """
-        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
+        buffer_groups = group_params_for_buffers(
+            params,
+            ddp_config.grad_reduce_in_fp32,
+            merge_layerwise_mxfp8_grads=not ddp_config.use_layer_wise_param_layout,
+        )
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
@@ -2909,6 +2913,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         for model_chunk in self.model_chunks:
+            model_chunk.finish_pending_param_sync()
             model_chunk.zero_grad_buffer()
         self._copy_main_params_to_param_buffer()
 

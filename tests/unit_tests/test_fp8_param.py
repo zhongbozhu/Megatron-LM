@@ -16,7 +16,6 @@ from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
@@ -64,6 +63,81 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
+
+
+def _assert_quantized_storage_is_separate(param, grad_data):
+    """Inspect TE payload allocations; quantized wrapper tensors have no own storage."""
+    payloads = {}
+    for holder in (param, param.data):
+        for name in (
+            "_data",
+            "_rowwise_data",
+            "_columnwise_data",
+            "rowwise_data",
+            "columnwise_data",
+        ):
+            payload = getattr(holder, name, None)
+            if torch.is_tensor(payload):
+                payloads[id(payload)] = payload
+    assert payloads, f"No materialized quantized payload found on {type(param).__name__}"
+    grad_storage_ptr = grad_data.untyped_storage().data_ptr()
+    for payload in payloads.values():
+        assert (
+            payload.untyped_storage().data_ptr() != grad_storage_ptr
+        ), "Reused FP8 staging must not replace TE quantized storage"
+
+
+def _assert_param_storage_policy(ddp, args):
+    """MXFP8 reuses gradient storage; compact buckets can also contain BF16."""
+    saw_reused_muon = False
+    for buffer in ddp.buffers + ddp.expert_parallel_buffers:
+        for bucket in buffer.buckets:
+            owners = {
+                getattr(p, "is_managed_by_layer_wise_optimizer", False) for p in bucket.params
+            }
+            assert len(owners) == 1, "A bucket cannot mix Muon and AdamW ownership"
+            is_muon = owners.pop()
+            if args.use_layer_wise_param_layout:
+                assert (
+                    len({(is_float8tensor(p) or is_float8tensor(p.data)) for p in bucket.params})
+                    == 1
+                ), "Padded buckets must separate quantized staging from persistent BF16 storage"
+            reused_params = [
+                param
+                for param in bucket.params
+                if args.fp8_param_gather
+                and is_mxfp8tensor(param)
+                and args.reuse_grad_buf_for_mxfp8_param_ag
+            ]
+            if reused_params:
+                saw_reused_muon |= is_muon
+                if bucket.param_data is not None:
+                    assert (
+                        bucket.param_data.untyped_storage().data_ptr()
+                        == bucket.grad_data.untyped_storage().data_ptr()
+                    ), "FP8 staging must reuse gradient storage"
+                for param in reused_params:
+                    _assert_quantized_storage_is_separate(param, buffer.grad_data)
+
+            for param in bucket.params:
+                if is_float8tensor(param) or is_float8tensor(param.data):
+                    continue
+                assert (
+                    param.data.untyped_storage().data_ptr()
+                    != bucket.grad_data.untyped_storage().data_ptr()
+                ), "High-precision forward weights must not alias gradient storage"
+                if is_muon and not args.use_layer_wise_param_layout:
+                    assert (
+                        bucket.param_data is None
+                    ), "Compact Muon BF16 params retain independent parameter storage"
+                else:
+                    assert bucket.param_data is not None
+                    assert (
+                        param.data.untyped_storage().data_ptr()
+                        == bucket.param_data.untyped_storage().data_ptr()
+                    ), "High-precision parameters must retain their DDP parameter-buffer views"
+    if args.fp8_param_gather:
+        assert saw_reused_muon, "The test did not exercise a reused Muon FP8 staging buffer"
 
 
 class TestFP8Param:
@@ -182,21 +256,21 @@ class TestFP8Param:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
-    def copy_main_params_to_param_buffer(self, model_chunks, optimizer):
-        # Mirrors MBridge's pre-eval fix: disable_forward_pre_hook(param_sync=True)
-        # force-syncs params before eval callbacks run, so MXFP8 must repopulate
-        # the shared param/grad buffer before disabling forward hooks.
-        for model_chunk in model_chunks:
-            model_chunk.zero_grad_buffer()
-        for optim_instance in optimizer.chained_optimizers:
-            if isinstance(optim_instance, DistributedOptimizer):
-                optim_instance._copy_main_params_to_param_buffer()
+    @staticmethod
+    def _uses_reused_param_buffer(model_chunks):
+        return any(
+            buffer.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+            and any(is_mxfp8tensor(param) for param in bucket.params)
+            for model in model_chunks
+            for buffer in model.buffers + model.expert_parallel_buffers
+            for bucket in buffer.buckets
+        )
 
     def run_eval_transition(self, args, model_chunks, optimizer, batch):
         input_ids, labels, position_ids, attention_mask, loss_mask = batch
 
-        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-            self.copy_main_params_to_param_buffer(model_chunks, optimizer)
+        if args.overlap_param_gather and self._uses_reused_param_buffer(model_chunks):
+            optimizer.prepare_model_params_for_param_sync()
 
         if should_disable_forward_pre_hook(args):
             disable_forward_pre_hook(model_chunks, param_sync=True)
@@ -296,11 +370,11 @@ class TestFP8Param:
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if getattr(args, "use_layer_wise_distributed_optimizer", False):
-            has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
-            assert has_param_layout == args.use_layer_wise_param_layout, (
-                "LayerWise test did not enter the requested parameter-layout path: "
-                f"requested={args.use_layer_wise_param_layout}, actual={has_param_layout}"
-            )
+            assert gpt_model[0].full_param_layout is not None
+            assert (
+                gpt_model[0].ddp_config.use_layer_wise_param_layout
+                == args.use_layer_wise_param_layout
+            ), "LayerWise test did not enter the requested parameter-layout path"
         self._on_model_built(gpt_model, optimizer, args)
 
         # Hard coded to use cuda_graph_impl="transformer_engine"
@@ -340,27 +414,32 @@ class TestFP8Param:
                 if not inference:
                     assert len(optimizer.chained_optimizers) >= 2
 
-        # Verify that bf16 params (embedding, LN, etc.) in the MXFP8 model are mapped
-        # to the param buffer (shared with grad buffer) rather than allocated separately.
-        if args.reuse_grad_buf_for_mxfp8_param_ag:
-            for buffer in gpt_model[0].buffers:
-                if buffer.param_data is None:
-                    continue
-                buf_start = buffer.param_data.data_ptr()
-                buf_end = buf_start + buffer.param_data.numel() * buffer.param_data.element_size()
-                for param in buffer.param_to_bucket:
-                    if is_mxfp8tensor(param):
-                        # MXFP8 params keep their own quantized storage.
-                        assert not (
-                            buf_start <= param.data.data_ptr() < buf_end
-                        ), "MXFP8 param should not be mapped to the param buffer"
-                    else:
-                        # BF16 params should be views into the param buffer
-                        # (no double allocation).
-                        assert buf_start <= param.data.data_ptr() < buf_end, (
-                            "BF16 param should be a view into the param buffer "
-                            "(no separate allocation)"
-                        )
+        # MXFP8 reuse leaves TE storage separate from the temporary gather buffer. Other params
+        # retain independent DDP parameter storage when their layout provides it.
+        if not inference:
+            for buffer in gpt_model[0].buffers + gpt_model[0].expert_parallel_buffers:
+                for bucket in buffer.buckets:
+                    if bucket.param_data is None:
+                        continue
+                    param_start = bucket.param_data.data_ptr()
+                    param_end = (
+                        param_start + bucket.param_data.numel() * bucket.param_data.element_size()
+                    )
+                    for param in bucket.params:
+                        if is_float8tensor(param):
+                            if (
+                                buffer.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                                and is_mxfp8tensor(param)
+                            ):
+                                _assert_quantized_storage_is_separate(param, buffer.grad_data)
+                        else:
+                            assert (
+                                bucket.param_data.untyped_storage().data_ptr()
+                                != bucket.grad_data.untyped_storage().data_ptr()
+                            ), "High-precision parameter storage must not alias gradient storage"
+                            assert (
+                                param_start <= param.data.data_ptr() < param_end
+                            ), "High-precision param should remain a DDP parameter-buffer view"
 
         loss_list = []
         eval_loss_list = []
@@ -408,18 +487,17 @@ class TestFP8Param:
                     enable_forward_pre_hook(gpt_model)
                     self.cuda_graph_helper.cuda_graph_set_manual_hooks()
 
-            # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
-            # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
-            # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+            # Use production ownership routing: Adam stages MXFP8 reuse buffers,
+            # while LayerWise stages its FP8 parameters when each gather launches.
             forward_pre_hook_enabled = bool(
                 getattr(gpt_model[0], 'remove_forward_pre_hook_handles', {})
             )
             if (
-                args.reuse_grad_buf_for_mxfp8_param_ag
+                self._uses_reused_param_buffer(gpt_model)
                 and args.overlap_param_gather
                 and forward_pre_hook_enabled
             ):
-                self.copy_main_params_to_param_buffer(gpt_model, optimizer)
+                optimizer.prepare_model_params_for_param_sync()
 
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
@@ -745,8 +823,8 @@ class TestFP8Param:
         for _ in range(num_steps):
             model[0].zero_grad_buffer()
             optimizer.zero_grad()
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                self.copy_main_params_to_param_buffer(model, optimizer)
+            if args.overlap_param_gather and self._uses_reused_param_buffer(model):
+                optimizer.prepare_model_params_for_param_sync()
             model[0].set_is_first_microbatch()
             output = model[0].forward(
                 input_ids=input_ids,
