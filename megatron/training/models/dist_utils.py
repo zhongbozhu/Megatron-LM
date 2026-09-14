@@ -85,8 +85,10 @@ def unimodal_build_distributed_models(
         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
         model_type: Deprecated flag, only used for backwards compatibility.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
+        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``, selects the
+            DDP layout for LayerWise-managed buffers: True (default) for shard-aligned padding,
+            or False for a compact layout. Adam buffers use the standard DistributedOptimizer
+            layout in both cases.
 
     Returns:
         List of model stages, wrapped and ready for distributed training.
@@ -160,8 +162,10 @@ def prepare_existing_model_chunks_for_distributed_training(
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
+        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``, selects the
+            DDP layout for LayerWise-managed buffers: True (default) for shard-aligned padding,
+            or False for a compact layout. Adam buffers use the standard DistributedOptimizer
+            layout in both cases.
 
     Returns:
         List of model chunks, wrapped and ready for distributed training.
@@ -282,9 +286,10 @@ def _ddp_wrap(
         use_torch_fsdp2: Whether to use PyTorch FSDP v2 instead of DDP
         pg_collection: Model communication process groups.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout to DDP.
-            ``False`` keeps LayerWise on its legacy ``allgather_params`` sync path.
+        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``, selects the
+            DDP layout for LayerWise-managed buffers: True (default) for shard-aligned padding,
+            or False for a compact layout. Adam buffers use the standard DistributedOptimizer
+            layout in both cases.
 
     Returns:
         list[MegatronModule]: List of DDP/FSDP wrapped model modules
@@ -320,21 +325,19 @@ def _ddp_wrap(
 
     # Argument validation converts --use-distributed-optimizer into
     # use_layer_wise_distributed_optimizer and clears the original, so re-enable it here:
-    # the layerwise optimizer needs the reduce-scatter and the shard-aligned param layout
-    # that the distributed-optimizer path provides. Mirrors wrap_model_chunks_with_ddp() in
+    # both layouts need per-buffer ownership and the Adam reduce-scatter path supplied by
+    # the distributed-optimizer infrastructure. Mirrors wrap_model_chunks_with_ddp() in
     # megatron/training/training.py, which handles the non-ModelBuilder path.
     compute_full_param_layout = DistributedOptimizer.compute_full_param_layout
-    if (
-        DP is DistributedDataParallel
-        and use_layer_wise_distributed_optimizer
-        and use_layer_wise_param_layout
-    ):
+    if DP is DistributedDataParallel and use_layer_wise_distributed_optimizer:
+        # Both layout choices tag optimizer ownership before allocating DDP buffers.
+        # Only the LayerWise buffers change between padded and compact layouts.
+        ddp_config.use_layer_wise_param_layout = use_layer_wise_param_layout
         ddp_config.use_distributed_optimizer = True
         compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
         # Tag params so DDP buffer grouping routes LayerWise-managed matrices
-        # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
-        # everything else (embeddings, biases, layernorm) to a separate
-        # DistOpt-style buffer.
+        # (Muon's Newton-Schulz domain) to their own buffer and routes everything else
+        # (embeddings, biases, layernorm) to a separate DistOpt-style buffer.
         tag_params_for_buffer_routing(model)
 
     if get_model_config(model[0]).cuda_graph_impl == "full_iteration":

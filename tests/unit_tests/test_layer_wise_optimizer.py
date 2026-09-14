@@ -152,11 +152,9 @@ class TestLayerWiseOptimizer:
             model_kwargs: Optional kwargs for model initialization
             use_layer_wise: If True, use LayerWiseDistributedOptimizer via dist_muon;
                           if False, use standard muon ChainedOptimizer (for reference)
-            use_param_layout: If True, supply DDP a precomputed shard-aligned
-                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
-                + ``start_param_sync``). If False (default), build DDP without a layout
-                so ``LayerWiseDistributedOptimizer`` syncs via the legacy
-                flatten / ``all_gather_v`` / unflatten ``allgather_params()`` codepath.
+            use_param_layout: If True, use a shard-aligned padded LayerWise layout.
+                If False (default), use a compact LayerWise layout. Adam parameters use
+                their own byte-level DistributedOptimizer buffers in both cases.
 
         Returns:
             tuple: (model, optimizer, pg_collection)
@@ -167,21 +165,15 @@ class TestLayerWiseOptimizer:
         model = model_class(**model_kwargs).bfloat16().cuda()
         model.requires_grad_(True)
 
-        if use_param_layout:
-            from megatron.training.training import wrap_model_chunks_with_ddp
+        from megatron.training.training import wrap_model_chunks_with_ddp
 
-            ddp_config = DistributedDataParallelConfig()
-            model = wrap_model_chunks_with_ddp(
-                [model],
-                TransformerConfig(num_attention_heads=1, num_layers=1),
-                ddp_config,
-                use_layer_wise_distributed_optimizer=use_layer_wise,
-            )[0]
-        else:
-            ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-            model = DistributedDataParallel(
-                TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-            )
+        ddp_config = DistributedDataParallelConfig(use_layer_wise_param_layout=use_param_layout)
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config,
+            use_layer_wise_distributed_optimizer=use_layer_wise,
+        )[0]
         if copy_from:
             model.module.load_state_dict(copy_from.module.state_dict())
         else:
@@ -196,6 +188,7 @@ class TestLayerWiseOptimizer:
             clip_grad=clip_grad,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=use_layer_wise,
+            use_layer_wise_param_layout=use_param_layout,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -235,9 +228,8 @@ class TestLayerWiseOptimizer:
                 verify that the DDP config remains authoritative. Defaults to the DDP value.
             grad_reduce_in_fp32: If True, reduce grads in fp32 (regression test for dtype fix)
             bucket_size: Maximum number of parameters per bucket (None = single bucket)
-            use_param_layout: If True, supply DDP a precomputed shard-aligned
-                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
-                + ``start_param_sync``). If False (default), build DDP without a layout.
+            use_param_layout: If True, use shard-aligned padding for LayerWise buffers;
+                if False (default), use a compact layout. Adam ownership is unchanged.
 
         Returns:
             tuple: (model, optimizer, pg_collection)
@@ -253,32 +245,21 @@ class TestLayerWiseOptimizer:
         # the two so a caller only has to flip one.
         overlap_grad_reduce = overlap_param_gather
 
-        if use_param_layout:
-            from megatron.training.training import wrap_model_chunks_with_ddp
+        from megatron.training.training import wrap_model_chunks_with_ddp
 
-            ddp_config = DistributedDataParallelConfig(
-                overlap_param_gather=overlap_param_gather,
-                overlap_grad_reduce=overlap_grad_reduce,
-                grad_reduce_in_fp32=grad_reduce_in_fp32,
-                bucket_size=bucket_size,
-            )
-            model = wrap_model_chunks_with_ddp(
-                [model],
-                TransformerConfig(num_attention_heads=1, num_layers=1),
-                ddp_config,
-                use_layer_wise_distributed_optimizer=True,
-            )[0]
-        else:
-            ddp_config = DistributedDataParallelConfig(
-                use_distributed_optimizer=False,
-                overlap_param_gather=overlap_param_gather,
-                overlap_grad_reduce=overlap_grad_reduce,
-                grad_reduce_in_fp32=grad_reduce_in_fp32,
-                bucket_size=bucket_size,
-            )
-            model = DistributedDataParallel(
-                TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-            )
+        ddp_config = DistributedDataParallelConfig(
+            use_layer_wise_param_layout=use_param_layout,
+            overlap_param_gather=overlap_param_gather,
+            overlap_grad_reduce=overlap_grad_reduce,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            bucket_size=bucket_size,
+        )
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config,
+            use_layer_wise_distributed_optimizer=True,
+        )[0]
         if copy_from:
             model.module.load_state_dict(copy_from.module.state_dict())
         else:
@@ -297,6 +278,7 @@ class TestLayerWiseOptimizer:
             overlap_param_gather=optimizer_overlap_param_gather,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=use_param_layout,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -695,8 +677,15 @@ class TestLayerWiseOptimizer:
 
         assert params_updated > 0, "At least some parameters should be updated"
 
-        # step() internal call allgather_params. replace reference object with bcast
-        reference_optimizer.allgather_params = reference_optimizer.broadcast_params
+        # Replace only Muon's compact gather; the Adam sibling retains its DistOpt sync.
+        reference_layer_wise_optimizer = next(
+            child
+            for child in reference_optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        reference_layer_wise_optimizer.allgather_params = (
+            reference_layer_wise_optimizer.broadcast_params
+        )
         reference_optimizer.step()
 
         # Verify updated values match reference optimizer
@@ -881,6 +870,9 @@ class TestLayerWiseOptimizer:
 
         for bucket_group in model.bucket_groups:
             for bucket in bucket_group.buckets:
+                if not getattr(bucket.params_list[0], 'is_managed_by_layer_wise_optimizer', False):
+                    assert bucket.layerwise_params_list is None
+                    continue
                 # layerwise_params_list should be populated by set_bucket_layerwise_params_list
                 assert (
                     bucket.layerwise_params_list is not None
@@ -1013,8 +1005,15 @@ class TestLayerWiseOptimizer:
 
         assert params_updated > 0, "At least some parameters should be updated"
 
-        # step() internally calls allgather_params. Replace reference with broadcast.
-        reference_optimizer.allgather_params = reference_optimizer.broadcast_params
+        # Replace only Muon's compact gather; the Adam sibling retains its DistOpt sync.
+        reference_layer_wise_optimizer = next(
+            child
+            for child in reference_optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        reference_layer_wise_optimizer.allgather_params = (
+            reference_layer_wise_optimizer.broadcast_params
+        )
         reference_optimizer.step()
 
         # Verify updated values match reference optimizer
