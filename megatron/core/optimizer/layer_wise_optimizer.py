@@ -14,7 +14,12 @@ from megatron.core.distributed.param_and_grad_buffer import group_params_for_buf
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
-from ..fp8_utils import copy_back_gathered_bf16_into_mxfp8_params, is_mxfp8tensor
+from ..fp8_utils import (
+    copy_back_gathered_bf16_into_fp8_params,
+    is_layerwise_fp8_param,
+    post_all_gather_processing,
+    uses_grad_buffer_for_fp8_param_gather,
+)
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
     ChainedOptimizer,
@@ -503,9 +508,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # fp8 Muon grads key to uint8 (own buffer); partition_buckets later merges the non-fp8
         # bucket groups into the fp8 group to aggregate communication.
         buffer_groups = group_params_for_buffers(
-            params,
-            ddp_config.grad_reduce_in_fp32,
-            merge_layerwise_mxfp8_grads=not use_padded_layout,
+            params, ddp_config.grad_reduce_in_fp32, merge_layerwise_fp8_grads=not use_padded_layout
         )
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
@@ -612,21 +615,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.shard_params(optimizers, full_param_layouts, model_chunks)
 
         # Engage FP8 param sync automatically when the LayerWise-managed params are actually
-        # quantized (fp8_param_gather on + supported MXFP8 weights). Off -> plain bf16.
-        # Also tag the gathered fp8 params: the fp8 all-gather (``_allgather_helper_mxfp8``)
+        # quantized (fp8_param_gather on + supported MXFP8/blockwise weights). Off -> plain bf16.
+        # Also tag the gathered fp8 params: the fp8 all-gather (``_allgather_helper_fp8``)
         # requantizes bf16 -> each rank's fp8 ``param.data``, so the child optimizer's pre-gather
         # fp8 copy-back into ``param.data`` is redundant for them and is skipped. Params in these
         # per-rank lists are all-gathered (dp_cp / expt_dp size > 1 here); non-gathered fp8 params
         # (e.g. expt_dp == 1 experts, which are absent from these lists) still need the copy-back.
-        self.use_mxfp8_param_sync = False
+        self.use_fp8_param_sync = False
         for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
             if not params_list:
                 continue
             for per_rank in params_list:
                 for p in per_rank:
-                    if is_mxfp8tensor(p):
-                        self.use_mxfp8_param_sync = True
-                        p._layer_wise_mxfp8_gathered = True
+                    if is_layerwise_fp8_param(p):
+                        self.use_fp8_param_sync = True
+                        p._layer_wise_fp8_gathered = True
 
         # Padded buffers use fixed-size AG. BF16 weights are views into that buffer; FP8 weights
         # keep TE storage and are staged from their masters immediately before AG. Compact
@@ -643,15 +646,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # launch it: a full layout uses the fixed-size parameter buffer, while the variable-size
         # path without a full layout uses grad_data. False means the optimizer calls
         # allgather_params() synchronously after its step, using temporary flatten/receive buffers.
-        reuse_grad_buf_for_mxfp8_param_ag = (
-            self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+        self.reuse_grad_buffer_for_param_ag = (
+            any(
+                uses_grad_buffer_for_fp8_param_gather(param, self.ddp_config)
+                for params_list in (self.dp_cp_params_list, self.expt_dp_params_list)
+                if params_list
+                for per_rank in params_list
+                for param in per_rank
+            )
             if self.ddp_config is not None
             else config.reuse_grad_buf_for_mxfp8_param_ag
         )
         self.layerwise_param_sync_via_bucket_group = (
             self.use_buffer_param_sync
             or self.overlap_param_gather
-            or reuse_grad_buf_for_mxfp8_param_ag
+            or self.reuse_grad_buffer_for_param_ag
         )
 
         # Explicit force-sync also needs this metadata, even when a BF16-only compact optimizer
@@ -693,6 +702,22 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # round-trip (``Q(bf16(master))``), matching the fp8-param-gather-OFF baseline;
                 # the gather staging itself reuses the grad buffer.
                 optimizers[i]._layer_wise_non_distopt_child = True
+
+            # shard_params() removed non-owned params from the local optimizer groups, so the
+            # Float16 wrapping above only clears the TE high-precision init copy (a full-size CPU
+            # tensor per fp8 param) for locally owned params. Without this sweep every DP rank
+            # retains ~(dp-1)/dp of the LayerWise matrix params' bf16 CPU copies for the whole
+            # run. The per-rank ownership lists cover all gathered params (owned entries were
+            # already cleared during master creation; TE's clear is a no-op then). Scoped to
+            # LayerWise-managed params only: sibling DistOpt params must keep their init val
+            # until their own optimizer's master creation consumes it.
+            for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
+                if not params_list:
+                    continue
+                for per_rank_params in params_list:
+                    for p in per_rank_params:
+                        if hasattr(p, 'clear_high_precision_init_val'):
+                            p.clear_high_precision_init_val()
 
         self.tp_group = self.pg_collection.tp
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
@@ -964,17 +989,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         Two transport variants share the same uneven (all-gather-v) shape:
 
-        * **bf16** (``use_mxfp8_param_sync=False``): all-gather owned bf16 ``param.data``, copy_ into
+        * **bf16** (``use_fp8_param_sync=False``): all-gather owned bf16 ``param.data``, copy_ into
           non-owned params.
-        * **fp8** (``use_mxfp8_param_sync=True``): stage owned fp32 master->bf16, all-gather bf16,
+        * **fp8** (``use_fp8_param_sync=True``): stage owned fp32 master->bf16, all-gather bf16,
           requantize into EVERY rank's ``param.data`` (owned included) so all hold
-          ``Q(bf16(master))`` (== OFF/Adam), rebuilding both MXFP8 usages from BF16.
+          ``Q(bf16(master))`` (== OFF/Adam). Then ``post_all_gather_processing`` rebuilds fp8
+          columnwise storage (blockwise; mxfp8 is a noop since copy-back already forced it).
         """
 
         # FP8-aware variant: stage bf16, uneven all-gather bf16, requantize per rank.
-        def _allgather_helper_mxfp8(params_list, group):
-            # MXFP8 must gather BF16: its rowwise and columnwise block scales cannot be
-            # derived from one another.
+        def _allgather_helper_fp8(params_list, group):
+            # TODO(perf, blockwise-only): blockwise could gather the owner's fp8 rowwise data
+            # (~2x less comm) instead of bf16; mxfp8 must stay on bf16. See the matching TODO in
+            # ``_ParamAndGradBucketGroup.start_param_sync`` for the full rationale.
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
             # Device from any non-empty owned list (rank 0 may own zero params in the layout).
@@ -1031,14 +1058,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params
                 ]
                 updated_params = _unflatten_dense_tensors(gather_list[idx], templates)
-                copy_back_gathered_bf16_into_mxfp8_params(params, updated_params)
+                copy_back_gathered_bf16_into_fp8_params(params, updated_params)
+
+            # Rebuild fp8 columnwise/transpose after the gather (mirrors the overlap / DistOpt
+            # paths; blockwise builds it, mxfp8 is a noop). Else it'd be deferred to forward.
+            fp8_params = [p for params in params_list for p in params if is_layerwise_fp8_param(p)]
+            if fp8_params:
+                post_all_gather_processing(fp8_params)
 
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
         def _allgather_helper(params_list, group):
             # Rank 0 may own zero params in this list -- the ping-pong assignment, and the
             # dtype split in ``_dispatch`` below, both leave per-rank lists that can be empty.
-            # Mirror ``_allgather_helper_mxfp8``'s lookup instead of indexing rank 0 blindly.
+            # Mirror ``_allgather_helper_fp8``'s lookup instead of indexing rank 0 blindly.
             _first = next((params[0] for params in params_list if len(params) > 0), None)
             if _first is None:
                 # No rank owns any param in this group -> nothing to gather.
@@ -1089,16 +1122,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # flatten is invalid. For a pure-bf16 model (no fp32 Muon params) the native group is
             # empty and this collapses to the original single-helper dispatch.
             staged = [
-                [p for p in owned if is_mxfp8tensor(p) or p.dtype != torch.float32]
+                [p for p in owned if is_layerwise_fp8_param(p) or p.dtype != torch.float32]
                 for owned in params_list
             ]
             native = [
-                [p for p in owned if not is_mxfp8tensor(p) and p.dtype == torch.float32]
+                [p for p in owned if not is_layerwise_fp8_param(p) and p.dtype == torch.float32]
                 for owned in params_list
             ]
             if any(owned for owned in staged):
                 staged_helper = (
-                    _allgather_helper_mxfp8 if self.use_mxfp8_param_sync else _allgather_helper
+                    _allgather_helper_fp8 if self.use_fp8_param_sync else _allgather_helper
                 )
                 staged_helper(staged, group)
             if any(owned for owned in native):

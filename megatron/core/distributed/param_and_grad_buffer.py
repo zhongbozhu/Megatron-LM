@@ -29,16 +29,18 @@ from ..fp4_utils import (
     modify_nvfp4_rowwise_storage,
 )
 from ..fp8_utils import (
-    copy_back_gathered_bf16_into_mxfp8_params,
+    copy_back_gathered_bf16_into_fp8_params,
     copy_tensors_to_quantized_params,
     is_float8tensor,
     is_grouped_mxfp8tensor,
     is_grouped_tensor,
     is_grouped_tensor_with_quantized_storage,
+    is_layerwise_fp8_param,
     is_mxfp8tensor,
     modify_grouped_tensor_rowwise_storage,
     modify_underlying_storage,
     post_all_gather_processing,
+    uses_grad_buffer_for_fp8_param_gather,
 )
 from ..optimizer.param_layout import pad_bucket_end, pad_param_start
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
@@ -122,6 +124,7 @@ class _ParamAndGradBucket:
         bucket_id: int,
         param_index_map: Dict[torch.nn.Parameter, tuple],
         params_with_extra_main_grads: List[torch.nn.Parameter],
+        reuse_grad_buffer_for_param_ag: bool = False,
     ):
         self.params_list = params
         self.params = set(params)
@@ -129,6 +132,7 @@ class _ParamAndGradBucket:
         assert len(self.params_list) == len(self.params)
         self.param_data = param_data
         self.grad_data = grad_data
+        self.reuse_grad_buffer_for_param_ag = reuse_grad_buffer_for_param_ag
         # The distributed optimizer needs to keep track of this bucket's offset
         # within the full grad_buffer.
         self.offset = offset
@@ -148,11 +152,11 @@ class _ParamAndGradBucket:
         self.layerwise_gather_list = None
 
     @torch.no_grad()
-    def _stage_layerwise_mxfp8_params(self, local_data_view: torch.Tensor, local_rank: int) -> None:
-        """Stage owner-rank LayerWise MXFP8 masters into the BF16 all-gather input.
+    def _stage_layerwise_fp8_params(self, local_data_view: torch.Tensor, local_rank: int) -> None:
+        """Stage owner-rank LayerWise FP8 masters into the BF16 all-gather input.
 
         LayerWise layouts keep each parameter wholly inside one data-parallel shard.
-        Unlike regular BF16 parameters, MXFP8 parameters retain TE-owned storage, so
+        Unlike regular BF16 parameters, FP8 parameters retain TE-owned storage, so
         updating ``param.data`` does not update this bucket's parameter buffer.
         """
         if not self.params_list or not getattr(
@@ -163,7 +167,7 @@ class _ParamAndGradBucket:
         local_shard_start = local_rank * local_data_view.numel()
         local_shard_end = local_shard_start + local_data_view.numel()
         for param in self.params_list:
-            if not (is_mxfp8tensor(param) or is_grouped_mxfp8tensor(param)):
+            if not (is_layerwise_fp8_param(param) or is_grouped_mxfp8tensor(param)):
                 continue
 
             param_start, param_end = self.param_to_index[param]
@@ -171,13 +175,13 @@ class _ParamAndGradBucket:
                 continue
             if not (local_shard_start <= param_start and param_end <= local_shard_end):
                 raise RuntimeError(
-                    "LayerWise MXFP8 parameter must be entirely inside its owner's DDP shard."
+                    "LayerWise FP8 parameter must be entirely inside its owner's DDP shard."
                 )
 
             main_param = getattr(param, 'main_param', None)
             if main_param is None:
                 raise RuntimeError(
-                    "The owner of a LayerWise MXFP8 parameter must have its FP32 main parameter."
+                    "The owner of a LayerWise FP8 parameter must have its FP32 main parameter."
                 )
 
             param_slot = local_data_view[
@@ -185,7 +189,7 @@ class _ParamAndGradBucket:
             ]
             if param_slot.numel() != main_param.numel():
                 raise RuntimeError(
-                    "LayerWise MXFP8 master and DDP parameter slot must have equal size: "
+                    "LayerWise FP8 master and DDP parameter slot must have equal size: "
                     f"master={main_param.numel()}, slot={param_slot.numel()}."
                 )
             param_slot.copy_(main_param.detach().reshape(-1))
@@ -222,16 +226,14 @@ class _LayerwiseAllGatherHandle:
 
 
 @torch.no_grad()
-def _layerwise_copy_back_gathered_params(
-    bucket, local_rank: int, mxfp8_staged: bool = False
-) -> None:
+def _layerwise_copy_back_gathered_params(bucket, local_rank: int, fp8_staged: bool = False) -> None:
     """Copy each rank's gathered params from the bucket gather slots into model params (non-DistOpt
-    LayerWise overlap path). ``mxfp8_staged`` MUST match ``start_param_sync``'s staging decision.
+    LayerWise overlap path). ``fp8_staged`` MUST match ``start_param_sync``'s staging decision.
 
-    * bf16 (``mxfp8_staged=False``): unflatten against the params, ``copy_`` into non-owned
+    * bf16 (``fp8_staged=False``): unflatten against the params, ``copy_`` into non-owned
       ``model_p.data`` (owned already hold the staged value).
-    * fp8 (``mxfp8_staged=True``): the all-gather rode bf16; requantize ALL ranks (owned included)
-      via ``copy_back_gathered_bf16_into_mxfp8_params`` so every owner holds
+    * fp8 (``fp8_staged=True``): the all-gather rode bf16; requantize ALL ranks (owned included)
+      via ``copy_back_gathered_bf16_into_fp8_params`` so every owner holds
       ``Q(bf16(master))``.
 
     no_grad: in-place copy_ on a leaf param trips autograd's in-place guard.
@@ -239,10 +241,10 @@ def _layerwise_copy_back_gathered_params(
     for idx, params in enumerate(bucket.layerwise_params_list):
         if len(params) == 0:
             continue
-        if mxfp8_staged:
+        if fp8_staged:
             templates = [torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params]
             updated_params = _unflatten_dense_tensors(bucket.layerwise_gather_list[idx], templates)
-            copy_back_gathered_bf16_into_mxfp8_params(params, updated_params)
+            copy_back_gathered_bf16_into_fp8_params(params, updated_params)
             continue
         # bf16 transport: owned params already hold the staged bf16 value in their data, so only
         # non-owned ranks need the copy.
@@ -278,7 +280,8 @@ class _ParamAndGradBucketGroup:
         self.buckets = buckets
         self.ddp_config = ddp_config
         self.param_sync_via_bucket_group = self.ddp_config.param_sync_via_bucket_group or any(
-            any(
+            bucket.reuse_grad_buffer_for_param_ag
+            or any(
                 getattr(param, 'is_managed_by_layer_wise_optimizer', False)
                 for param in bucket.params_list
             )
@@ -401,7 +404,7 @@ class _ParamAndGradBucketGroup:
             _layerwise_copy_back_gathered_params(
                 bucket,
                 self.intra_distributed_optimizer_instance_rank,
-                mxfp8_staged=getattr(bucket, 'layerwise_mxfp8_staged', False),
+                fp8_staged=getattr(bucket, 'layerwise_fp8_staged', False),
             )
             bucket.layerwise_gather_list = None
             # Zero out grad_data since it was reused as the all-gather
@@ -412,52 +415,45 @@ class _ParamAndGradBucketGroup:
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
-        if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-            for bucket in self.buckets:
-                if bucket.param_data is None:
-                    # LayerWise variable-size gather path: params are already updated via
-                    # unflatten + copy_ in finish_param_sync, and there is no param_data
-                    # buffer to copy back from.
-                    continue
-                has_non_quantized_weight = False
-                quantized_params = []
-                param_slices = []
-                flat_param_data = bucket.param_data.view(-1)
-                for param in bucket.params:
-                    # Non-quantized weights are already mapped to param.data. Skip
-                    # mixed buckets because zeroing bucket.param_data would also
-                    # clear those model weights.
-                    if not _param_uses_quantized_storage(param):
-                        has_non_quantized_weight = True
-                        break
-                    param_start, param_end = bucket.param_to_index[param]
-                    if is_mxfp8tensor(param) and getattr(
-                        param, 'is_managed_by_layer_wise_optimizer', False
-                    ):
-                        # Eval may leave MXFP8 rowwise-only; rebuild both usages from BF16.
-                        param.data._get_quantizer().set_usage(rowwise=True, columnwise=True)
-                    quantized_params.append(param)
-                    param_slices.append(flat_param_data[param_start:param_end])
-                # Cast the bucket in one call: these casts are small, so the per-param cost of
-                # issuing them is worth avoiding.
-                copy_tensors_to_quantized_params(quantized_params, param_slices)
-                if has_non_quantized_weight:
-                    continue
-                # All-gathered params are not needed after being copied to param.data.
-                # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
-                # We cannot zero out the entire grad buffer because one grad buffer may
-                # correspond to multiple param buffers. If we zero out the entire grad buffer,
-                # it would clear the data of those param buffers that have not yet completed AG.
-                bucket.param_data.zero_()
-            return
-
-        quantized_params = []
         for bucket in self.buckets:
-            for param in bucket.params:
-                if _param_uses_quantized_storage(param):
-                    quantized_params.append(param)
-        if len(quantized_params) > 0:
-            post_all_gather_processing(quantized_params)
+            quantized_params = [
+                param for param in bucket.params_list if _param_uses_quantized_storage(param)
+            ]
+            if bucket.reuse_grad_buffer_for_param_ag and bucket.param_data is not None:
+                # Padded FP8 buffers carry BF16 transport values; their TE weights own separate
+                # storage. BF16 sibling buckets may be in this group but are never cleared here.
+                assert len(quantized_params) == len(bucket.params_list)
+                flat_param_data = bucket.param_data.view(-1)
+                param_slices = [
+                    flat_param_data[slice(*bucket.param_to_index[param])]
+                    for param in quantized_params
+                ]
+                layerwise_params, layerwise_slices = [], []
+                other_params, other_slices = [], []
+                for param, param_slice in zip(quantized_params, param_slices):
+                    if getattr(param, 'is_managed_by_layer_wise_optimizer', False) and (
+                        is_layerwise_fp8_param(param)
+                    ):
+                        layerwise_params.append(param)
+                        layerwise_slices.append(param_slice)
+                    else:
+                        other_params.append(param)
+                        other_slices.append(param_slice)
+                # MXFP8 must generate both rowwise and columnwise values from BF16. In
+                # particular, eval may have left the quantizer configured for rowwise only.
+                if layerwise_params:
+                    copy_back_gathered_bf16_into_fp8_params(layerwise_params, layerwise_slices)
+                if other_params:
+                    copy_tensors_to_quantized_params(other_params, other_slices)
+
+            if quantized_params:
+                # Blockwise needs its columnwise storage refreshed after BF16 copy-back as well
+                # as after native FP8 transport. Compact copy-back already ran in finalize.
+                post_all_gather_processing(quantized_params)
+
+            if bucket.reuse_grad_buffer_for_param_ag and bucket.param_data is not None:
+                # Other buckets may still have pending gathers into the same grad allocation.
+                bucket.param_data.zero_()
 
     def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
@@ -546,22 +542,27 @@ class _ParamAndGradBucketGroup:
             layerwise_work_handles = []
             for bucket in self.buckets:
                 # A compact LayerWise (Muon) bucket can mix supported FP8 and BF16 params:
-                # merge_layerwise_mxfp8_grads keys fp8 Muon grads by their bf16 logical dtype so they
+                # merge_layerwise_fp8_grads keys fp8 Muon grads by their bf16 logical dtype so they
                 # share ONE buffer (hence bucket) with their bf16 siblings (e.g. an MoE router /
                 # DSA indexer / mHC weight that is not fp8-quantized). The bf16-staged path handles
                 # both dtypes, so a bucket holding ANY supported fp8 param must take it -- scanning
                 # only params_list[0] mis-routes a bf16-first mixed bucket into the raw
                 # _flatten_dense_tensors() path, which crashes on the MXFP8 .view(-1).
-                bucket_is_mxfp8 = bool(
-                    self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                bucket_is_fp8 = bool(
+                    bucket.reuse_grad_buffer_for_param_ag
                     and bucket.params_list
-                    and any(is_mxfp8tensor(p) for p in bucket.params_list)
+                    and any(is_layerwise_fp8_param(p) for p in bucket.params_list)
                 )
+                # TODO(perf, blockwise-only): blockwise could gather the owner's fp8 rowwise data
+                # (~2x less comm) + its small scale_inv and rebuild columnwise via transpose
+                # (Adam/DistOpt-style), instead of bf16. mxfp8 must stay on bf16: its row/col block
+                # scales cannot be derived from one another.
+                #
                 # Persist the staging decision so the copy-back (sync here, overlap in
                 # finish_param_sync) uses the same signal, keeping transport and copy-back in sync.
-                bucket.layerwise_mxfp8_staged = bucket_is_mxfp8
+                bucket.layerwise_fp8_staged = bucket_is_fp8
                 # FP8 parameters travel as BF16; ordinary parameters keep their own dtype.
-                param_dtype = torch.bfloat16 if bucket_is_mxfp8 else bucket.params_list[0].dtype
+                param_dtype = torch.bfloat16 if bucket_is_fp8 else bucket.params_list[0].dtype
 
                 if max(bucket.layerwise_param_flat_sizes) == 0:
                     bucket.layerwise_gather_list = None
@@ -592,7 +593,7 @@ class _ParamAndGradBucketGroup:
                     for param in bucket.layerwise_params_list[local_rank]:
                         param_numel = param.numel()
                         transport_view = local_slot_view[local_offset : local_offset + param_numel]
-                        if bucket_is_mxfp8 or is_mxfp8tensor(param):
+                        if bucket_is_fp8 or is_mxfp8tensor(param):
                             # Compact FP8 buckets stage every param from its FP32 master so
                             # mixed FP8/BF16 buckets all use the same high-precision source.
                             # Padded buckets need the same source only for MXFP8, whose tensor
@@ -644,8 +645,8 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_param_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-                        bucket._stage_layerwise_mxfp8_params(
+                    if bucket.reuse_grad_buffer_for_param_ag:
+                        bucket._stage_layerwise_fp8_params(
                             local_data_view, self.intra_distributed_optimizer_instance_rank
                         )
                     dist_all_gather_func(
@@ -1001,7 +1002,7 @@ class _ParamAndGradBucketGroup:
 def group_params_for_buffers(
     params: List[torch.nn.Parameter],
     grad_reduce_in_fp32: bool,
-    merge_layerwise_mxfp8_grads: bool = False,
+    merge_layerwise_fp8_grads: bool = False,
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
     """Group parameters by buffer identity for buffer allocation.
 
@@ -1020,7 +1021,7 @@ def group_params_for_buffers(
     Args:
         params: List of parameters to group.
         grad_reduce_in_fp32: Whether gradients are reduced in FP32.
-        merge_layerwise_mxfp8_grads: Compact layout only — merge LayerWise (Muon) fp8 grads with
+        merge_layerwise_fp8_grads: Compact layout only — merge LayerWise (Muon) fp8 grads with
             their bf16 siblings into one fp32 all_reduce buffer (see below).
 
     Returns:
@@ -1047,8 +1048,8 @@ def group_params_for_buffers(
         # Compact layout only: key FP8 Muon grads by their BF16 logical dtype so FP8 + BF16 grads
         # share ONE fp32 all_reduce buffer; a split uint8/bf16 reduction diverges ~1 ULP from OFF.
         if (
-            merge_layerwise_mxfp8_grads
-            and is_mxfp8tensor(param)
+            merge_layerwise_fp8_grads
+            and is_layerwise_fp8_param(param)
             and is_managed_by_layer_wise_optimizer
         ):
             param_dtype = param.dtype
@@ -1201,6 +1202,17 @@ class _ParamAndGradBuffer:
         # Compact Muon buffers all-reduce gradients; Adam siblings retain their DistOpt layout.
         if self._is_layer_wise_buffer and not self.ddp_config.use_layer_wise_param_layout:
             self.ddp_config = dataclasses.replace(self.ddp_config, use_distributed_optimizer=False)
+        self.reuse_grad_buffer_for_param_ag = any(
+            uses_grad_buffer_for_fp8_param_gather(param, self.ddp_config) for param in self.params
+        )
+        if self.ddp_config.use_distributed_optimizer and self.reuse_grad_buffer_for_param_ag:
+            # A persistent BF16 weight must never alias temporary gather storage. Padded layouts
+            # group quantized weights separately; compact layouts may mix them, but have no
+            # persistent param_data and copy all gathered values back before clearing grad_data.
+            assert all(
+                uses_grad_buffer_for_fp8_param_gather(param, self.ddp_config)
+                for param in self.params
+            ), "Reused padded FP8 buffers cannot contain persistent model weights."
 
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
@@ -1252,6 +1264,27 @@ class _ParamAndGradBuffer:
             # nvfp4_packed_numel_unpadded is already set by _compute_nvfp4_packed_layout.
 
         assert self.numel_unpadded <= self.numel
+
+        # Diagnostic: log persistent buffer size vs. unpadded payload so the cost of any
+        # optimizer-driven padding (e.g. the LayerWise shard-aligned ``dp_size * max(shard_load)``
+        # layout) is visible per buffer. Emit at INFO only when it is interesting — a
+        # LayerWise-managed buffer or one that actually carries padding — and DEBUG otherwise, so
+        # ordinary (zero-padding) buffers do not spam non-experimental runs.
+        _padding = self.numel - self.numel_unpadded
+        _pad_frac = _padding / max(self.numel_unpadded, 1)
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO if (self._is_layer_wise_buffer or _padding > 0) else logging.DEBUG,
+            f"ParamAndGradBuffer layout: param_dtype={self.param_dtype} "
+            f"grad_dtype={self.grad_dtype} dp_world_size={self.data_parallel_world_size} "
+            f"layerwise={self._is_layer_wise_buffer} "
+            f"distopt={self.ddp_config.use_distributed_optimizer} "
+            f"numel={self.numel} numel_unpadded={self.numel_unpadded} "
+            f"padding={_padding} ({_pad_frac:.1%})",
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+        )
+
         if self.has_nvfp4_params:
             assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
         if self.ddp_config.use_distributed_optimizer:
@@ -1290,12 +1323,10 @@ class _ParamAndGradBuffer:
             mem_alloc_context = nullcontext
 
         with mem_alloc_context():
-            # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
+            # Reused FP8 transport: share BF16 parameter AG storage with weight gradients.
             # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
             # It can be temporarily reused by param AG.
-            if self.ddp_config.use_distributed_optimizer and any(
-                is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
-            ):
+            if self.ddp_config.use_distributed_optimizer and self.reuse_grad_buffer_for_param_ag:
                 self.shared_buffer = torch.zeros(
                     self.numel,
                     dtype=self.grad_dtype,
@@ -1372,18 +1403,8 @@ class _ParamAndGradBuffer:
             nvfp4_packed_param_start_index = None
             if self.has_nvfp4_params:
                 nvfp4_packed_param_start_index, _, _ = self.nvfp4_packed_param_index_map[param]
-            # This branch remaps the parameter storage into persistent DDP param_data buffer.
-            #
-            # Enter when:
-            # - `reuse_grad_buf_for_mxfp8_param_ag` is off: param AG has a persistent
-            #   param_data buffer instead of sharing storage with grad_data,
-            #   so every parameter must be backed by param_data.
-            # - param is not quantized: BF16/FP16/plain params still need persistent
-            #   param_data even when quantized params use grad_data as temporary AG storage.
-            #
-            # Skip only when both are true: AG reuses grad_data and the param is quantized.
-            # In that case AG writes into grad_data, then _post_param_sync copies the
-            # gathered values back into TE quantized storage.
+            # Parameters using BF16 transport retain TE storage. Other parameters keep their
+            # normal persistent DDP mapping, independent of the sibling FP8 reuse policy.
             #
             # Remap cases below:
             #   non-grouped TE NVFP4 tensor   -> remap packed rowwise bytes
@@ -1392,10 +1413,7 @@ class _ParamAndGradBuffer:
             #   TE GroupedTensor + NVFP4      -> remap packed rowwise bytes
             #   TE GroupedTensor + MXFP8      -> unsupported here; require grad-buffer AG reuse
             #   TE GroupedTensor + BF16/FP16  -> remap grouped rowwise_data
-            if (
-                not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                or not _param_uses_quantized_storage(param)
-            ):
+            if not uses_grad_buffer_for_fp8_param_gather(param, self.ddp_config):
                 if self.param_data is not None:
                     if not is_grouped_tensor(param):
                         # Plain NVFP4: remap packed rowwise bytes only.
@@ -1740,6 +1758,10 @@ class _ParamAndGradBuffer:
             bucket_id=bucket_id,
             param_index_map=self.param_index_map,
             params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+            reuse_grad_buffer_for_param_ag=any(
+                uses_grad_buffer_for_fp8_param_gather(param, self.ddp_config)
+                for param in bucket_params
+            ),
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket

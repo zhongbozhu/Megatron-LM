@@ -194,7 +194,7 @@ class DistributedDataParallel(_BaseDataParallel):
         buffer_groups = group_params_for_buffers(
             all_params,
             self.ddp_config.grad_reduce_in_fp32,
-            merge_layerwise_mxfp8_grads=not self.ddp_config.use_layer_wise_param_layout,
+            merge_layerwise_fp8_grads=not self.ddp_config.use_layer_wise_param_layout,
         )
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.

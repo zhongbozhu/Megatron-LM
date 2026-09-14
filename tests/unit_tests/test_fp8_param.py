@@ -12,7 +12,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.enums import ModelType
-from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
+from megatron.core.fp8_utils import is_blockwise_float8tensor, is_float8tensor, is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -88,7 +88,7 @@ def _assert_quantized_storage_is_separate(param, grad_data):
 
 
 def _assert_param_storage_policy(ddp, args):
-    """MXFP8 reuses gradient storage; compact buckets can also contain BF16."""
+    """Reuse is selected per FP8 parameter; compact buckets can also contain BF16."""
     saw_reused_muon = False
     for buffer in ddp.buffers + ddp.expert_parallel_buffers:
         for bucket in buffer.buckets:
@@ -106,9 +106,12 @@ def _assert_param_storage_policy(ddp, args):
                 param
                 for param in bucket.params
                 if args.fp8_param_gather
-                and is_mxfp8tensor(param)
-                and args.reuse_grad_buf_for_mxfp8_param_ag
+                and (
+                    (is_mxfp8tensor(param) and args.reuse_grad_buf_for_mxfp8_param_ag)
+                    or (is_blockwise_float8tensor(param) and is_muon)
+                )
             ]
+            assert bucket.reuse_grad_buffer_for_param_ag == bool(reused_params)
             if reused_params:
                 saw_reused_muon |= is_muon
                 if bucket.param_data is not None:
@@ -132,6 +135,7 @@ def _assert_param_storage_policy(ddp, args):
                     ), "Compact Muon BF16 params retain independent parameter storage"
                 else:
                     assert bucket.param_data is not None
+                    assert not bucket.reuse_grad_buffer_for_param_ag
                     assert (
                         param.data.untyped_storage().data_ptr()
                         == bucket.param_data.untyped_storage().data_ptr()
@@ -259,8 +263,7 @@ class TestFP8Param:
     @staticmethod
     def _uses_reused_param_buffer(model_chunks):
         return any(
-            buffer.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-            and any(is_mxfp8tensor(param) for param in bucket.params)
+            bucket.reuse_grad_buffer_for_param_ag
             for model in model_chunks
             for buffer in model.buffers + model.expert_parallel_buffers
             for bucket in buffer.buckets
@@ -414,7 +417,7 @@ class TestFP8Param:
                 if not inference:
                     assert len(optimizer.chained_optimizers) >= 2
 
-        # MXFP8 reuse leaves TE storage separate from the temporary gather buffer. Other params
+        # Quantized reuse is a per-bucket storage decision. High-precision params
         # retain independent DDP parameter storage when their layout provides it.
         if not inference:
             for buffer in gpt_model[0].buffers + gpt_model[0].expert_parallel_buffers:
@@ -427,12 +430,10 @@ class TestFP8Param:
                     )
                     for param in bucket.params:
                         if is_float8tensor(param):
-                            if (
-                                buffer.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                                and is_mxfp8tensor(param)
-                            ):
+                            if bucket.reuse_grad_buffer_for_param_ag:
                                 _assert_quantized_storage_is_separate(param, buffer.grad_data)
                         else:
+                            assert not bucket.reuse_grad_buffer_for_param_ag
                             assert (
                                 bucket.param_data.untyped_storage().data_ptr()
                                 != bucket.grad_data.untyped_storage().data_ptr()

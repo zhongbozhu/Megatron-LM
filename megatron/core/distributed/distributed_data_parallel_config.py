@@ -306,7 +306,8 @@ class DistributedDataParallelConfig:
             return True
 
         # For compact LayerWise buffers, these flags select forward-scheduled overlap or
-        # synchronous MXFP8 reuse.
+        # synchronous MXFP8 reuse. Bucket groups additionally account for implicit blockwise
+        # FP8 reuse using their per-bucket storage metadata.
         return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
 
     def __post_init__(self):

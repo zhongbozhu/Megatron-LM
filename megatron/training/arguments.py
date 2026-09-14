@@ -1842,21 +1842,23 @@ def validate_args(args, defaults={}):
     )
 
     if args.use_layer_wise_distributed_optimizer:
-        # MXFP8 transport is independent of the padded/compact LayerWise buffer layout.
-        # Gather BF16 values staged in grad storage, then quantize locally.
+        # FP8 transport is independent of the padded/compact LayerWise buffer layout.
+        # Both recipes gather BF16 values staged in grad storage, then quantize locally.
+        # MXFP8 requires the existing opt-in; LayerWise blockwise reuse is implicit.
         assert not getattr(args, 'fp4_param_gather', False), (
-            "The LayerWise distributed optimizer supports MXFP8 parameter gather only; "
-            "fp4_param_gather is not supported."
+            "The LayerWise distributed optimizer supports fp8 parameter gather only "
+            "(mxfp8 or blockwise); fp4_param_gather is not supported."
         )
         if args.fp8_param_gather:
-            assert args.fp8_recipe == 'mxfp8', (
+            assert args.fp8_recipe in ('mxfp8', 'blockwise'), (
                 "LayerWise fp8 parameter gather requires "
-                f"fp8_recipe='mxfp8'; got {args.fp8_recipe!r}."
+                f"fp8_recipe in {{'mxfp8', 'blockwise'}}; got {args.fp8_recipe!r}."
             )
-            assert args.reuse_grad_buf_for_mxfp8_param_ag, (
-                "LayerWise mxfp8 + --fp8-param-gather requires "
-                "--reuse-grad-buf-for-mxfp8-param-ag."
-            )
+            if args.fp8_recipe == 'mxfp8':
+                assert args.reuse_grad_buf_for_mxfp8_param_ag, (
+                    "LayerWise mxfp8 + --fp8-param-gather requires "
+                    "--reuse-grad-buf-for-mxfp8-param-ag."
+                )
         assert args.num_distributed_optimizer_instances == 1, (
             "The LayerWise distributed optimizer requires "
             "num_distributed_optimizer_instances == 1: Muon and sibling Adam buffers "
