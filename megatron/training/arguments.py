@@ -3988,8 +3988,6 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
-    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
-                       help='SFT prompt format.')
     group.add_argument('--sft-mock-dataset-config-json', type=str, default=None,
                        help='This config provides the necessary information for the mock '
                        'dataset. Accepts either an inline JSON literal or a path to a JSON '
