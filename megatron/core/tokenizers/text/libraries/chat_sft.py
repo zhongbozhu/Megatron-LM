@@ -124,6 +124,26 @@ def _find_tokens(ids, pattern, start):
     return -1
 
 
+def _single_sequence(values, *, dtype, name):
+    """Normalize an unbatched sequence or a one-row tokenizer tensor."""
+    array = np.asarray(values, dtype=dtype)
+    if array.ndim == 2 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim != 1:
+        raise ValueError(f"Expected a single {name} sequence, got shape {array.shape}")
+    return array
+
+
+def _input_ids(encoded):
+    # HF versions/custom tokenizers may return a list or a BatchEncoding even
+    # without return_dict=True. Converting the mapping itself reads its keys.
+    if isinstance(encoded, Mapping):
+        encoded = encoded["input_ids"]
+    elif hasattr(encoded, "input_ids"):
+        encoded = encoded.input_ids
+    return _single_sequence(encoded, dtype=np.int64, name="input_ids")
+
+
 def _chatml_masks(hf, ids, messages, tools, template):
     """Bridge-compatible ChatML boundaries in the full rendered token stream.
 
@@ -136,7 +156,7 @@ def _chatml_masks(hf, ids, messages, tools, template):
             raise ValueError("Chat payload contains an assistant delimiter; mask is ambiguous")
 
     def encode(text):
-        return list(hf(text, add_special_tokens=False)["input_ids"])
+        return _input_ids(hf(text, add_special_tokens=False)).tolist()
 
     start_tokens = encode(_CHATML_START)
     end_tokens = encode(_CHATML_END)
@@ -218,7 +238,7 @@ def tokenize_chat(
         **_resolve_template_kwargs(hf, template, chat_template_kwargs),
     )
     if loss_mode == "full":
-        ids = np.asarray(hf.apply_chat_template(messages, tokenize=True, **kwargs), dtype=np.int64)
+        ids = _input_ids(hf.apply_chat_template(messages, tokenize=True, **kwargs))
         mask = np.ones(ids.shape, dtype=bool)
         _mask_chatml_control_tokens(hf, ids, mask, chatml)
         return ids, np.where(mask, ids, IGNORE_INDEX)
@@ -231,15 +251,16 @@ def tokenize_chat(
         encoded = hf.apply_chat_template(
             messages, tokenize=True, return_dict=True, return_assistant_tokens_mask=True, **kwargs
         )
-        ids = np.asarray(encoded["input_ids"], dtype=np.int64)
-        mask = np.asarray(encoded.get("assistant_masks", []), dtype=bool)
+        ids = _input_ids(encoded)
+        raw_mask = encoded.get("assistant_masks")
+        mask = _single_sequence(
+            [] if raw_mask is None else raw_mask, dtype=bool, name="assistant_masks"
+        )
         if mask.shape != ids.shape and not chatml:
             raise ValueError("Chat template returned an invalid assistant mask")
     if chatml:
         if not generation_mask:
-            ids = np.asarray(
-                hf.apply_chat_template(messages, tokenize=True, **kwargs), dtype=np.int64
-            )
+            ids = _input_ids(hf.apply_chat_template(messages, tokenize=True, **kwargs))
         fallback, end_mask = _chatml_masks(hf, ids, messages, tools, template)
         # Bridge uses the fallback for absent/empty HF masks and otherwise
         # augments only turn endings; it does not replace a valid content mask.
@@ -272,7 +293,7 @@ def tokenize_chat(
         if len(spans) != sum(m["role"] == "assistant" for m in messages):
             raise ValueError("Assistant delimiters do not match the rendered conversation")
         encoded = hf(rendered, add_special_tokens=False, return_offsets_mapping=True)
-        ids = np.asarray(encoded["input_ids"], dtype=np.int64)
+        ids = _input_ids(encoded)
         mask = np.zeros(ids.shape, dtype=bool)
         span_index = 0
         for i, (start, end) in enumerate(encoded["offset_mapping"]):

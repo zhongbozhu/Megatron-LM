@@ -11,6 +11,7 @@ import json
 import os
 import pickle
 import sys
+from collections import UserDict
 from itertools import islice
 from pathlib import Path
 from types import SimpleNamespace
@@ -256,6 +257,58 @@ class ChatMLHF(FakeHF):
         self.template_kwargs = kwargs.copy()
         result = super().apply_chat_template(messages, tokenize=tokenize, **kwargs)
         return {"input_ids": result} if tokenize and kwargs.get("return_dict") else result
+
+
+@pytest.mark.parametrize("mode", ["assistant", "full", "generation"])
+@pytest.mark.parametrize("container", [list, dict, UserDict])
+@pytest.mark.parametrize("batched", [False, True])
+def test_chat_template_return_containers_preserve_tokens_and_mask(mode, container, batched):
+    class ReturnedHF(ChatMLHF):
+        def get_chat_template(self, **kwargs):
+            template = super().get_chat_template(**kwargs)
+            return template + "{% generation %}" if mode == "generation" else template
+
+        def apply_chat_template(self, messages, **kwargs):
+            text = FakeHF.apply_chat_template(self, messages, tokenize=False)
+            ids = [ord(c) for c in text]
+            start = text.index(START) + len(START)
+            # Deliberately supervise only the first body token. Flattening must
+            # preserve this valid HF mask, not replace it with a full-body fallback.
+            mask = [int(i == start) for i in range(len(ids))]
+            values = np.array([ids]) if batched else ids
+            if mode == "generation":
+                result = {
+                    "input_ids": values,
+                    "assistant_masks": np.array([mask]) if batched else mask,
+                }
+                return UserDict(result) if container is UserDict else result
+            if container is list:
+                return values
+            return container(input_ids=values, attention_mask=[1] * len(ids))
+
+    hf = ReturnedHF()
+    ids, targets = tokenize(
+        hf,
+        [{"role": "assistant", "content": "answer"}],
+        loss_mode="full" if mode == "full" else "assistant",
+    )
+    assert ids.ndim == targets.ndim == 1
+    assert ids.dtype == targets.dtype == np.int64
+    assert "".join(map(chr, ids)) == hf.rendered
+    expected = (
+        hf.rendered if mode == "full" else ("a" if mode == "generation" else "answer") + END + "\n"
+    )
+    assert "".join(chr(i) for i in targets if i != -100) == expected
+
+
+@pytest.mark.parametrize("loss_mode", ["assistant", "full"])
+def test_chat_template_rejects_multiple_sequences_in_one_row(loss_mode):
+    class BatchedHF(ChatMLHF):
+        def apply_chat_template(self, messages, **kwargs):
+            return UserDict(input_ids=[[1, 2], [3, 4]])
+
+    with pytest.raises(ValueError, match="single"):
+        tokenize(BatchedHF(), [{"role": "assistant", "content": "answer"}], loss_mode=loss_mode)
 
 
 @pytest.mark.parametrize("configured_end", [None, END, END + "\n"])
