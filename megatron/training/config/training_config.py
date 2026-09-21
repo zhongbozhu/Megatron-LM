@@ -755,5 +755,18 @@ class TokenizerConfig:
     chat_template: Optional[str] = None
     """Custom chat template in jinja format for conversation formatting."""
 
+    sft_tokenizer_prompt_format: str = "nemotron-h-aligned"
+    """SFT template format; the literal 'default' selects the HF tokenizer's own template."""
+
+    sft_loss_mode: Optional[Literal["assistant", "full"]] = None
+    """Explicit HF chat supervision. None preserves legacy SFT masking."""
+
+    sft_assistant_start: Optional[str] = None
+    """Literal prefix before assistant content, for templates without generation tags."""
+
+    sft_assistant_end: Optional[str] = None
+    """Assistant terminator included in boundary loss. Recognized ChatML templates
+    also include an existing trailing newline, following Bridge's chat policy."""
+
     use_gigatoken: Optional[bool] = False
     """Whether to use faster implementation of tokenizers (gigatoken)"""

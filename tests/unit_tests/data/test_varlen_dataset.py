@@ -259,6 +259,21 @@ def test_select_converter_messages():
     assert fn is _messages_passthrough
 
 
+def test_select_converter_bridge_materialized_columns():
+    fn, name = _select_converter(
+        ["conversation", "environment_image", "finish_reason", "license", "reward", "tools", "trajectory_id"]
+    )
+    assert name == "bridge-conversation"
+    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    assert fn({"conversation": messages}) == _messages_passthrough({"messages": messages})
+
+
+def test_select_converter_messages_keeps_priority_over_bridge_conversation():
+    fn, name = _select_converter(["messages", "conversation", "conversations", "text"])
+    assert name == "openai-messages"
+    assert fn is _messages_passthrough
+
+
 def test_select_converter_priority_messages_over_alpaca():
     # When both ``messages`` and alpaca-style columns are present, the more
     # explicit ``messages`` schema wins.
@@ -464,6 +479,7 @@ def _make_config(tokenizer, seq_length=64, *, cp=1, dp=1, sp=1, sbhd=False):
         varlen_sbhd_validation=sbhd,
         data_parallel_size=dp,
         context_parallel_size=cp,
+        dynamic_context_parallel=False,
         hybrid_context_parallel=False,
         sequence_parallel_size=sp,
     )
@@ -519,6 +535,146 @@ def test_getitem_thd_sft_prompt_is_masked():
     loss_mask = out["loss_mask"]
     assert torch.all(loss_mask[labels == IGNORE_INDEX] == 0.0)
     assert loss_mask.sum() > 0  # assistant span still contributes
+
+
+class _ExplicitChatTokenizer(_FakeTokenizer):
+    sft_loss_mode = "assistant"
+
+    def tokenize_conversation(self, messages, *, tools=None, chat_template_kwargs=None, **kwargs):
+        self.seen_tools = tools
+        self.seen_template_kwargs = chat_template_kwargs
+        return super().tokenize_conversation(messages, **kwargs)
+
+
+@pytest.mark.parametrize("sbhd", [False, True])
+def test_explicit_chat_keeps_tools_and_does_not_append_synthetic_eos(sbhd):
+    tok = _ExplicitChatTokenizer(eod=0, pad=None)
+    row = {
+        "messages": [{"role": "user", "content": "xx"}, {"role": "assistant", "content": "abc"}],
+        "tools": [{"type": "function", "function": {"name": "shell"}}],
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    out = _make_varlen([row], _make_config(tok, cp=2, sbhd=sbhd))[0]
+    assert tok.seen_tools == row["tools"]
+    assert tok.seen_template_kwargs == row["chat_template_kwargs"]
+    assert out["loss_mask"].sum().item() == 3
+    assert out["loss_mask"][:4].tolist() == [0, 1, 1, 1]
+    assert not out["loss_mask"][4:].any()
+    assert out["tokens"][:4].tolist() == tok.tokenize("xxab")
+    if not sbhd:
+        # Five template tokens become four next-token positions, not five.
+        assert out["original_seq_len"].item() == out["padded_seq_len"].item() == 4
+
+
+def test_explicit_chat_truncation_inside_user_does_not_create_eos_label():
+    tok = _ExplicitChatTokenizer(eod=0, pad=None)
+    row = {
+        "messages": [
+            {"role": "user", "content": "xx"},
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "content": "zzzzzzzz"},
+        ]
+    }
+    out = _make_varlen([row], _make_config(tok, seq_length=4))[0]
+    assert out["loss_mask"].tolist() == [0, 1, 0, 0]
+    assert out["labels"][-1].item() == IGNORE_INDEX
+    assert out["tokens"][-1].item() == tok.tokenize("z")[0]
+
+
+def test_explicit_chat_truncation_losing_all_targets_fails():
+    tok = _ExplicitChatTokenizer()
+    row = {
+        "messages": [
+            {"role": "user", "content": "long prompt"},
+            {"role": "assistant", "content": "answer"},
+        ]
+    }
+    ds = _make_varlen([row], _make_config(tok, seq_length=4))
+    with pytest.raises(ValueError, match="No assistant targets remain"):
+        ds[0]
+
+
+@pytest.mark.parametrize("conversation_key", ["messages", "conversation"])
+@pytest.mark.parametrize("loss_mode", ["assistant", "full"])
+def test_explicit_chat_low_level_preserves_messages_and_tools(tmp_path, conversation_key, loss_mode):
+    row = {
+        conversation_key: [
+            {"role": "user", "content": "run a command"},
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "inspect the files",
+                "tool_calls": [{"function": {"name": "shell", "arguments": '{"command":"ls"}'}}],
+            },
+            {"role": "tool", "content": "files", "tool_call_id": "call-1"},
+        ],
+        "tools": [{"function": {"name": "shell"}}],
+        "trajectory_id": "trajectory-1",
+        "reward": 1,
+        "chat_template_kwargs": {"truncate_history_thinking": False},
+    }
+    path = tmp_path / "data.jsonl"
+    path.write_text(json.dumps(row) + "\n")
+    tokenizer = _ExplicitChatTokenizer()
+    tokenizer.sft_loss_mode = loss_mode
+    low_level = VarlenDataset.build_low_level_dataset(str(path), _make_config(tokenizer))
+    assert len(low_level) == 1
+    assert low_level[0] == {
+        "messages": row[conversation_key],
+        "tools": row["tools"],
+        "chat_template_kwargs": row["chat_template_kwargs"],
+    }
+    assert low_level.dataset[0] == row
+
+
+def test_bridge_conversation_matches_messages_after_varlen_tokenization(tmp_path):
+    """Changing the storage key must not change tokens, targets or THD lengths."""
+    messages = [{"role": "user", "content": "xx"}, {"role": "assistant", "content": "abc"}]
+    tools = [{"function": {"name": "shell"}}]
+    outputs = []
+    for key in ("messages", "conversation"):
+        path = tmp_path / f"{key}.jsonl"
+        path.write_text(json.dumps({key: messages, "tools": tools}) + "\n")
+        tokenizer = _ExplicitChatTokenizer(eod=0, pad=None)
+        config = _make_config(tokenizer, cp=8)
+        low_level = VarlenDataset.build_low_level_dataset(str(path), config)
+        outputs.append(_make_varlen(low_level, config)[0])
+        assert tokenizer.seen_tools == tools
+    assert outputs[0].keys() == outputs[1].keys()
+    for key in outputs[0]:
+        assert torch.equal(outputs[0][key], outputs[1][key]), key
+
+
+@pytest.mark.parametrize("loss_mode", ["assistant", "full"])
+@pytest.mark.parametrize("sbhd", [False, True])
+@pytest.mark.parametrize("seq_length", [4, 64])
+def test_explicit_chat_shift_and_truncation_match_bridge_trajectory_contract(
+    loss_mode, sbhd, seq_length
+):
+    class Tokenizer(_ExplicitChatTokenizer):
+        sft_loss_mode = loss_mode
+
+        def tokenize_conversation(self, *args, **kwargs):
+            # Rendered template: prompt, two answer tokens, turn end, newline.
+            ids = np.array([10, 11, 20, 21, 30, 31])
+            mask = np.array([0, 0, 1, 1, 1, 1], dtype=bool)
+            return ids, np.where(mask if loss_mode == "assistant" else True, ids, IGNORE_INDEX)
+
+    tok = Tokenizer(eod=99)
+    out = _make_varlen(
+        [{"messages": []}], _make_config(tok, seq_length=seq_length, cp=2, sbhd=sbhd)
+    )[0]
+    # Bridge keeps the template prefix (at most max_len+1), then shifts once.
+    ids = [10, 11, 20, 21, 30, 31][: seq_length + 1]
+    n = len(ids) - 1
+    expected_mask = ([0, 1, 1, 1, 1] if loss_mode == "assistant" else [1] * 5)[:n]
+    assert out["tokens"][:n].tolist() == ids[:-1]
+    assert out["loss_mask"][:n].tolist() == expected_mask
+    active = out["loss_mask"][:n].bool()
+    assert out["labels"][:n][active].tolist() == [t for t, m in zip(ids[1:], expected_mask) if m]
+    assert not out["loss_mask"][n:].any()
+    if not sbhd:
+        assert out["original_seq_len"].item() == n
 
 
 def test_getitem_thd_pad_masked_by_position_keeps_real_eod():

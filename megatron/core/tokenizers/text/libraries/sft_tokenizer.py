@@ -5,6 +5,8 @@ from typing import Dict, List, Union
 
 import numpy as np
 
+from megatron.core.tokenizers.text.libraries.chat_sft import tokenize_chat
+
 try:
     import transformers
 
@@ -46,7 +48,16 @@ class PromptConfig:
 class SFTTokenizer:
     """SFT Tokenizer."""
 
-    def __init__(self, tokenizer_path: str, prompt_format: str, use_gigatoken: bool = False):
+    def __init__(
+        self,
+        tokenizer_path: str,
+        prompt_format: str,
+        use_gigatoken: bool = False,
+        loss_mode=None,
+        assistant_start=None,
+        assistant_end=None,
+        chat_template=None,
+    ):
         """
         Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
 
@@ -54,7 +65,27 @@ class SFTTokenizer:
             tokenizer_path (str): Underlying tokenizer path.
             prompt_format (str): Prompt format for the tokenizer.
             use_gigatoken (bool): Whether to use gigatoken for tokenization.
+            loss_mode: None preserves legacy masking; assistant/full uses the
+                complete HF chat template with tool metadata retained.
+            assistant_start, assistant_end: Explicit delimiters for templates
+                without generation tags. ChatML also supervises an existing
+                newline after the end marker, matching Bridge's chat policy.
+            chat_template: Optional HF template override.
         """
+        if loss_mode not in (None, "assistant", "full"):
+            raise ValueError("SFT loss_mode must be assistant or full")
+        if loss_mode is not None and (prompt_format != "default" or use_gigatoken):
+            raise ValueError(
+                "Explicit SFT loss mode requires default HF prompt format without gigatoken"
+            )
+        if bool(assistant_start) != bool(assistant_end):
+            raise ValueError("Both assistant delimiters must be configured together")
+        self.loss_mode = loss_mode
+        self.assistant_start = assistant_start
+        self.assistant_end = assistant_end
+        # Leave None intact so HF can select a named default/tool-use template;
+        # tokenizer.chat_template itself may be a dictionary of templates.
+        self._explicit_chat_template = chat_template
         if HAVE_TRANSFORMERS:
             # Currently, only HuggingFace tokenizers are supported.
             tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -108,6 +139,8 @@ class SFTTokenizer:
             raise NotImplementedError("unknown SFT prompt format", prompt_format)
 
         self._prompt_format = prompt_format
+        if chat_template is not None:
+            self._prompt_config.custom_chat_template = chat_template
 
         self.use_gigatoken = use_gigatoken
         self._hf_tokenizer = self._tokenizer
@@ -137,7 +170,13 @@ class SFTTokenizer:
         return arr[0] if arr.ndim == 2 and arr.shape[0] == 1 else arr
 
     def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+        self,
+        conversation: List[Dict],
+        return_target: bool,
+        add_generation_prompt: bool,
+        *,
+        tools=None,
+        chat_template_kwargs=None,
     ):
         """Convert a conversation to tokens.
 
@@ -149,9 +188,25 @@ class SFTTokenizer:
                     {"role": "user", "content": "something1"},
                     {"role": "assistant", "content": "something2"},
                 ]
-            return_target (bool): Return target tokens with system and assistant masked.
+            return_target (bool): Return targets using the configured loss policy.
             add_generation_prompt (bool): Add assistant prefix to the end.
+            chat_template_kwargs: Per-row template controls, e.g. enable_thinking.
         """
+        if self.loss_mode is not None:
+            tokens, targets = tokenize_chat(
+                self._hf_tokenizer,
+                conversation,
+                tools=tools,
+                template=self._explicit_chat_template,
+                loss_mode=self.loss_mode if return_target else "full",
+                assistant_start=self.assistant_start,
+                assistant_end=self.assistant_end,
+                add_generation_prompt=add_generation_prompt,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+            return (tokens, targets) if return_target else tokens
+        if tools is not None or chat_template_kwargs is not None:
+            raise ValueError("Tool schemas and template controls require an explicit SFT loss mode")
         # Skip system message if the tokenizer doesn't have a system role.
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
