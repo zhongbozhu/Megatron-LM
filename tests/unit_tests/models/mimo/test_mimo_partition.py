@@ -14,6 +14,7 @@ import torch
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -192,6 +193,7 @@ class TestPartitionAdapterShard:
         labels = torch.randint(0, 100, (2, 7))
         loss_mask = torch.ones(2, 7)
         packed_seq_params = MagicMock(spec=PackedSeqParams)
+        packed_seq_params.local_cp_size = None
         packed_seq_params.qkv_format = 'thd'
         packed_seq_params.cu_seqlens_q_padded = torch.tensor([0, 4, 7], dtype=torch.int32)
 
@@ -319,6 +321,7 @@ class TestPartitionAdapterApplyContextParallel:
         adapter = PartitionAdapter(cfg)
         embeddings = torch.rand(2, 5, 16)
         packed_seq_params = MagicMock(spec=PackedSeqParams)
+        packed_seq_params.local_cp_size = None
         packed_seq_params.qkv_format = 'thd'
         with (
             patch('megatron.core.models.mimo.partition.utils._HAVE_TEX', False),
@@ -339,6 +342,73 @@ def _expected_cp_zigzag_shard(tensor: torch.Tensor, cp_size: int, cp_rank: int) 
         return tensor
     chunks = list(torch.chunk(tensor, 2 * cp_size, dim=1))
     return torch.cat([chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]], dim=1)
+
+
+@pytest.mark.experimental
+@pytest.mark.skipif(
+    int(os.environ.get('WORLD_SIZE', '1')) != 4, reason="Runtime MIMO CP test requires 4 GPUs"
+)
+@pytest.mark.parametrize("static_cp", [1, 2])
+def test_runtime_thd_partition_forward_backward(static_cp):
+    """Changing runtime CP preserves per-document ownership and its gradient transpose."""
+    Utils.initialize_distributed()
+    groups = []
+    local_groups = {}
+    rank = torch.distributed.get_rank()
+    try:
+        for cp in (1, 2, 4):
+            for start in range(0, 4, cp):
+                ranks = list(range(start, start + cp))
+                group = torch.distributed.new_group(ranks)
+                if rank in ranks:
+                    local_groups[cp] = group
+                    groups.append(group)
+        adapter = PartitionAdapter(
+            PartitionConfig(
+                use_cp=static_cp > 1,
+                seq_parallel=False,
+                tp_comm_overlap=False,
+                max_seq_len=48,
+                cp_group=local_groups[static_cp],
+            )
+        )
+        # The different sequence lengths catch splitting the whole pack into 2*CP chunks.
+        boundaries = torch.tensor([0, 16, 48], dtype=torch.int32, device='cuda')
+        positions = torch.arange(48, device='cuda').unsqueeze(0)
+        for cp in (1, 4, 2, 1):
+            group = local_groups[cp]
+            packed = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=boundaries,
+                cu_seqlens_kv=boundaries,
+                cu_seqlens_q_padded=boundaries,
+                cu_seqlens_kv_padded=boundaries,
+                local_cp_size=cp,
+                cp_group=group,
+            )
+            embeddings = positions.t().unsqueeze(-1).float().requires_grad_()
+            expected_indices = torch.cat(
+                [
+                    _expected_cp_zigzag_shard(positions[:, :16], cp, group.rank()),
+                    _expected_cp_zigzag_shard(positions[:, 16:], cp, group.rank()),
+                ],
+                dim=1,
+            )
+            local_embeddings, local_labels, local_mask, returned = adapter.shard(
+                embeddings, positions, positions >= 43, packed
+            )
+            torch.testing.assert_close(local_embeddings[:, 0, 0], expected_indices[0].float())
+            torch.testing.assert_close(local_labels, expected_indices)
+            torch.testing.assert_close(local_mask, expected_indices >= 43)
+            assert returned is packed
+            local_embeddings.square().sum().backward()
+            expected_grad = torch.zeros_like(embeddings)
+            indices = expected_indices.flatten()
+            expected_grad[indices, 0, 0] = 2 * indices.float()
+            torch.testing.assert_close(embeddings.grad, expected_grad)
+    finally:
+        for group in reversed(groups):
+            torch.distributed.destroy_process_group(group)
 
 
 @pytest.mark.experimental

@@ -972,6 +972,7 @@ def compute_routing_scores_for_aux_loss(
     score_function: str,
     fused: bool = False,
     padding_mask: Optional[torch.Tensor] = None,
+    precomputed_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute routing scores based on the score function.
 
@@ -984,10 +985,15 @@ def compute_routing_scores_for_aux_loss(
         padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
                                                Shape [num_tokens]. True = padding (exclude),
                                                False = valid (include). Defaults to None.
+        precomputed_indices (torch.Tensor, optional): Fixed top-k expert IDs, shape
+            [num_tokens, topk]. Only the routing map is fixed; normalized scores and their
+            gradients still use all current logits. Requires fused=False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
     """
+    if fused and precomputed_indices is not None:
+        raise ValueError("Fixed auxiliary routing indices require fused=False.")
     if fused:
         if not HAVE_TE or fused_compute_score_for_moe_aux_loss is None:
             raise ValueError(
@@ -1013,7 +1019,10 @@ def compute_routing_scores_for_aux_loss(
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
 
-        _, top_indices = torch.topk(scores, k=topk, dim=1)
+        if precomputed_indices is None:
+            _, top_indices = torch.topk(scores, k=topk, dim=1)
+        else:
+            top_indices = precomputed_indices
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     # Apply padding mask to scores if provided

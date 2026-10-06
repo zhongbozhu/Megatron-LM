@@ -1047,6 +1047,80 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+def _iter_mtp_loss_masks(
+    loss_mask, num_layers, mtp_input_mask=None, cp_group=None, packed_seq_params=None
+):
+    """Yield each depth's supervision mask and count using the actual MTP shift rules."""
+    cumulative_mtp_input_mask = None
+    if mtp_input_mask is not None:
+        assert mtp_input_mask.shape == loss_mask.shape, (
+            f"mtp_input_mask shape {mtp_input_mask.shape} must match "
+            f"loss_mask shape {loss_mask.shape}"
+        )
+        mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+    for _ in range(num_layers):
+        if mtp_input_mask is not None:
+            # One invalid conditioning token masks every later step on that path.
+            mask_metadata = torch.cat((loss_mask, mtp_input_mask.to(dtype=loss_mask.dtype)), dim=0)
+            mask_metadata, _ = roll_tensor(
+                mask_metadata,
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                return_sum=False,
+            )
+            loss_mask, mtp_input_mask = mask_metadata.chunk(2, dim=0)
+            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+            if cumulative_mtp_input_mask is None:
+                cumulative_mtp_input_mask = mtp_input_mask
+            else:
+                cumulative_mtp_input_mask = cumulative_mtp_input_mask & mtp_input_mask
+            layer_loss_mask = loss_mask * cumulative_mtp_input_mask
+            yield layer_loss_mask, layer_loss_mask.sum()
+        else:
+            loss_mask, num_tokens = roll_tensor(
+                loss_mask,
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            yield loss_mask, num_tokens
+
+
+@torch.no_grad()
+def get_mtp_loss_token_counts(
+    loss_mask: Tensor,
+    num_mtp_layers: int,
+    *,
+    mtp_input_mask: Optional[Tensor] = None,
+    packed_seq_params: Optional[PackedSeqParams] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Tensor:
+    """Count main and MTP supervision tokens before scheduling decoder packs.
+
+    ``loss_mask`` follows the SFT label convention, after any input-to-label shift.
+    Use full original samples with CP1 (or no group), then sum their counts once
+    over the source global batch. No reduction is performed here: CP-local calls
+    return local counts, while replicated full samples must not be counted again.
+    Pass the resulting ``[main, depth 1, ...]`` vector to every pack through
+    ``PackedSeqParams.mtp_loss_token_counts``. This shares the loss computation's
+    exact boundary and cumulative modality-conditioning mask semantics.
+    """
+    if num_mtp_layers < 0:
+        raise ValueError("num_mtp_layers must be nonnegative")
+    cp_group = resolve_cp_group(cp_group, packed_seq_params)
+    counts = [loss_mask.sum()]
+    counts.extend(
+        count
+        for _, count in _iter_mtp_loss_masks(
+            loss_mask, num_mtp_layers, mtp_input_mask, cp_group, packed_seq_params
+        )
+    )
+    return torch.stack(counts)
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Tensor,
@@ -1101,6 +1175,14 @@ def process_mtp_loss(
         Tensor: Main-model hidden states with the MTP loss attached.
     """
     cp_group = resolve_cp_group(cp_group, packed_seq_params)
+    step_token_counts = (
+        packed_seq_params.mtp_loss_token_counts if packed_seq_params is not None else None
+    )
+    if step_token_counts is not None:
+        if not config.calculate_per_token_loss:
+            raise ValueError("Step-global MTP token counts require calculate_per_token_loss")
+        if step_token_counts.ndim != 1 or step_token_counts.numel() != config.mtp_num_layers + 1:
+            raise ValueError("mtp_loss_token_counts must contain main and every MTP depth's count")
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0] if main_hidden_states is None else main_hidden_states
 
@@ -1147,14 +1229,9 @@ def process_mtp_loss(
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
 
-    cumulative_mtp_input_mask = None
-    rolled_num_tokens = original_num_tokens
-    if mtp_input_mask is not None:
-        assert mtp_input_mask.shape == loss_mask.shape, (
-            f"mtp_input_mask shape {mtp_input_mask.shape} must match "
-            f"loss_mask shape {loss_mask.shape}"
-        )
-        mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+    mtp_masks = _iter_mtp_loss_masks(
+        loss_mask, config.mtp_num_layers, mtp_input_mask, cp_group, packed_seq_params
+    )
 
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
@@ -1173,38 +1250,7 @@ def process_mtp_loss(
             return_sum=False,
         )
 
-        if mtp_input_mask is not None:
-            # Each MTP step consumes one additional token. Accumulate validity so
-            # one invalid conditioning token also masks every later step on that path.
-            mask_metadata = torch.cat((loss_mask, mtp_input_mask.to(dtype=loss_mask.dtype)), dim=0)
-            mask_metadata, _ = roll_tensor(
-                mask_metadata,
-                shifts=-1,
-                dims=-1,
-                cp_group=cp_group,
-                packed_seq_params=packed_seq_params,
-                return_sum=False,
-            )
-            loss_mask, mtp_input_mask = mask_metadata.chunk(2, dim=0)
-            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
-            if cumulative_mtp_input_mask is None:
-                cumulative_mtp_input_mask = mtp_input_mask
-            else:
-                cumulative_mtp_input_mask = cumulative_mtp_input_mask & mtp_input_mask
-            layer_loss_mask = loss_mask * cumulative_mtp_input_mask
-            num_tokens = layer_loss_mask.sum()
-        else:
-            loss_mask, rolled_num_tokens = roll_tensor(
-                loss_mask,
-                shifts=-1,
-                dims=-1,
-                cp_group=cp_group,
-                packed_seq_params=packed_seq_params,
-            )
-            layer_loss_mask = loss_mask
-            # roll_tensor already computed this reduction. Preserve the legacy
-            # no-mask fast path for all non-multimodal MTP callers.
-            num_tokens = rolled_num_tokens
+        layer_loss_mask, num_tokens = next(mtp_masks)
 
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
 
@@ -1242,19 +1288,24 @@ def process_mtp_loss(
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
             # finalize_model_grads divides by the global main-loss token count.
-            # Use one main/MTP token ratio for this logical microbatch, independent
-            # of its CP partition. Rolling and masking can leave different ratios
-            # (or no valid tokens) on individual ranks. Keep the local counts above
-            # unchanged for logging, which reduces them separately over DP+CP.
-            normalization_tokens = torch.stack((original_num_tokens, num_tokens))
-            if cp_group is not None and cp_group.size() > 1:
-                torch.distributed.all_reduce(
-                    normalization_tokens, op=torch.distributed.ReduceOp.SUM, group=cp_group
+            # Keep local counts for logging; normalization may use a step-global
+            # denominator or, by default, this logical microbatch's CP-wide counts.
+            if step_token_counts is not None:
+                # All packs use the same ratio. The later global main-token divisor
+                # then gives an MTP token mean over the entire optimizer step.
+                main_num_tokens = step_token_counts[0].detach().to(mtp_loss.device)
+                mtp_num_tokens = (
+                    step_token_counts[mtp_layer_number + 1].detach().to(mtp_loss.device)
                 )
-            main_num_tokens, mtp_num_tokens = normalization_tokens.unbind()
-            # Clamp only after the collective; empty ranks must participate too.
-            # This preserves CP partition invariance, not a global MTP-token mean
-            # across different DP microbatches with different main/MTP ratios.
+            else:
+                normalization_tokens = torch.stack((original_num_tokens, num_tokens))
+                if cp_group is not None and cp_group.size() > 1:
+                    torch.distributed.all_reduce(
+                        normalization_tokens, op=torch.distributed.ReduceOp.SUM, group=cp_group
+                    )
+                main_num_tokens, mtp_num_tokens = normalization_tokens.unbind()
+                # The default preserves CP partition invariance, not invariance
+                # across packs with different main/MTP supervision-token ratios.
             mtp_loss_normalized = (
                 mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
             )
@@ -1572,14 +1623,17 @@ class MultiTokenPredictionLayer(MegatronModule):
             return_sum=False,
         )
         if padding_mask is not None:
-            padding_mask, _ = roll_tensor(
-                padding_mask,
+            # roll_tensor zero-fills sequence ends and physical padding. Roll
+            # validity so these fabricated conditioning positions stay masked.
+            valid_tokens, _ = roll_tensor(
+                ~padding_mask,
                 shifts=-1,
                 dims=-1,
                 cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
             )
+            padding_mask = ~valid_tokens
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -1940,12 +1994,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
 
         if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
-            assert (
-                self.config.recompute_num_layers == 1
-            ), "recompute_num_layers must be 1 for MTP recompute"
+            # Each legacy MTP instance checkpoints its own single Transformer layer.
+            # The decoder's recompute_num_layers controls decoder chunks independently.
             with outer_quantization_context:
                 outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':

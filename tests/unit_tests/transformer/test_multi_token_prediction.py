@@ -680,7 +680,7 @@ class TestMultiTokenPredictionLayer:
         input_ids = torch.tensor([[1, 2, 3, 4, 0, 0], [5, 6, 7, 0, 0, 0]], dtype=torch.int64)
         position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
         padding_mask = torch.tensor(
-            [[True, True, True, True, False, False], [True, True, True, False, False, False]]
+            [[False, False, False, False, True, True], [False, False, False, True, True, True]]
         )
         hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
 
@@ -700,7 +700,9 @@ class TestMultiTokenPredictionLayer:
 
         expected_input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
         expected_position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
-        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
+        expected_padding_mask = torch.tensor(
+            [[False, False, False, True, True, True], [False, False, True, True, True, True]]
+        )
 
         assert torch.equal(rolled_input_ids, expected_input_ids)
         assert torch.equal(rolled_position_ids, expected_position_ids)
@@ -914,7 +916,7 @@ class TestMultiTokenPredictionLayer:
         batch_size = 2
         input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=torch.int64)
         position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
-        padding_mask = torch.tensor([[True, True, True, False], [True, True, False, False]])
+        padding_mask = torch.tensor([[False, False, False, True], [False, False, True, True]])
         hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
         attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool)
         seen = {}
@@ -958,7 +960,9 @@ class TestMultiTokenPredictionLayer:
             embedding=fake_embedding,
         )
 
-        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
+        expected_padding_mask = torch.tensor(
+            [[False, False, True, True], [False, True, True, True]]
+        )
         assert torch.equal(seen["padding_mask"], expected_padding_mask)
         assert torch.equal(returned_padding_mask, expected_padding_mask)
 
@@ -2845,7 +2849,8 @@ class TestMultiTokenPrediction:
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
     )
-    def test_packed_sequences_with_full_recompute(self):
+    @pytest.mark.parametrize("recompute_num_layers", [1, 4])
+    def test_packed_sequences_with_full_recompute(self, recompute_num_layers):
         """MTP + packed sequences + full activation recomputation.
 
         Regression: MTP._checkpointed_forward used to forward
@@ -2862,6 +2867,8 @@ class TestMultiTokenPrediction:
         args = self.create_test_args(
             tp=1, cp=1, sequence_length=total_seq_length, micro_batch_size=1, full_recompute=True
         )
+        args.num_layers = 4
+        args.recompute_num_layers = recompute_num_layers
         set_args(args)
 
         torch.manual_seed(_SEED)

@@ -553,6 +553,10 @@ class TopKRouter(Router):
         if global_aux_loss_coeff == 0:
             return probs
 
+        step = getattr(self, "_global_aux_loss_step", None)
+        if step is not None:
+            return step.apply(self, probs, scores_for_aux_loss, routing_map)
+
         # Use unified function to compute tokens_per_expert and num_tokens
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
@@ -836,6 +840,47 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
+        # Diagnostics can freeze expert choices by logical token identity while retaining
+        # the current logits and their gradients. Record and replay use the same unfused
+        # score function; the controller owns identity, storage and index validation.
+        fixed_routing = getattr(self, "_fixed_routing", None)
+        fixed_indices = None
+        if fixed_routing is not None:
+            if (
+                self.routing_type in ("sinkhorn", "quantile_balancing")
+                or self.expert_bias is not None
+                or self.config.moe_router_num_groups is not None
+                or self.config.moe_router_group_topk is not None
+                or self.config.moe_expert_capacity_factor is not None
+                or self.config.moe_expert_rank_capacity_factor is not None
+                or self.router_replay is not None
+            ):
+                raise ValueError("Fixed routing requires ordinary, dropless top-k routing.")
+
+            def default_selector():
+                with torch.no_grad():
+                    return topk_routing_with_score_function(
+                        logits,
+                        self.topk,
+                        use_pre_softmax=self.config.moe_router_pre_softmax,
+                        scaling_factor=self.config.moe_router_topk_scaling_factor,
+                        score_function=self.score_function,
+                        fused=False,
+                        dense_output=True,
+                    )[1]
+
+            fixed_indices = fixed_routing.select(
+                self, logits, default_selector, padding_mask, packed_seq_params
+            )
+            if (
+                fixed_indices.shape != (logits.shape[0], self.topk)
+                or fixed_indices.dtype != torch.long
+                or fixed_indices.device != logits.device
+            ):
+                raise ValueError(
+                    "Fixed routing must return long [tokens, topk] IDs on logits.device."
+                )
+
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
@@ -854,8 +899,9 @@ class TopKRouter(Router):
                 scaling_factor=self.config.moe_router_topk_scaling_factor,
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
-                fused=self.config.moe_router_fusion,
+                fused=self.config.moe_router_fusion if fixed_indices is None else False,
                 router_replay=self.router_replay,
+                precomputed_indices=fixed_indices,
             )
 
         # Apply token dropping to probs and routing_map.
@@ -870,31 +916,42 @@ class TopKRouter(Router):
             )
 
         # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+        step = getattr(self, "_global_aux_loss_step", None)
+        collecting_statistics = step is not None and step.collecting_statistics
+        auditing_training = step is not None and step.auditing_training
+        if step is not None and step.audit_token_assignments:
+            step.observe_dispatch(self, routing_map, padding_mask)
+        if (
+            self.training
+            and (torch.is_grad_enabled() or collecting_statistics or auditing_training)
+            and self.is_aux_loss_enabled()
+        ):
             # Calculate scores and routing_map for aux loss
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits,
                 self.topk,
                 self.score_function,
-                fused=self.config.moe_router_aux_loss_fusion,
+                fused=self.config.moe_router_aux_loss_fusion if fixed_indices is None else False,
                 padding_mask=padding_mask,
+                precomputed_indices=fixed_indices,
             )
-            probs = self._apply_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                with_padding_mask=padding_mask is not None,
-                packed_seq_params=packed_seq_params,
-            )
-            probs = self._apply_seq_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                seq_length,
-                bsz,
-                with_padding_mask=padding_mask is not None,
-                packed_seq_params=packed_seq_params,
-            )
+            if not collecting_statistics and torch.is_grad_enabled():
+                probs = self._apply_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    with_padding_mask=padding_mask is not None,
+                    packed_seq_params=packed_seq_params,
+                )
+                probs = self._apply_seq_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    seq_length,
+                    bsz,
+                    with_padding_mask=padding_mask is not None,
+                    packed_seq_params=packed_seq_params,
+                )
             probs = self._apply_global_aux_loss(
                 probs,
                 scores_for_aux_loss,

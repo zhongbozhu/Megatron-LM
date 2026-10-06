@@ -1065,7 +1065,12 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens: Optional[int] = None
         self._padded_num_tokens: Optional[int] = None
 
+    @torch.compiler.disable
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+        # This method performs an EP collective followed by a host scalar read.
+        # Keep it out of dispatch_preprocess's compiled region: compiler constant
+        # folding can synchronize CUDA while peers enter HybridEP initialization,
+        # breaking collective order when ranks specialize different token shapes.
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
 

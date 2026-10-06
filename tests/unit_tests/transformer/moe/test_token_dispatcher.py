@@ -556,6 +556,59 @@ def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
     assert not manager.token_probs[local_num_tokens:].any()
 
 
+def test_hybridep_compiled_caller_keeps_metadata_collective_eager(monkeypatch):
+    """Uneven per-rank graph specializations must not capture metadata collectives."""
+    Utils.initialize_distributed()
+    group = torch.distributed.group.WORLD
+    manager = _HybridEPManager.__new__(_HybridEPManager)
+    manager.group = group
+    manager.num_local_experts = 2
+    manager.num_experts = 2 * group.size()
+    manager.config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=manager.num_experts,
+        moe_router_topk=2,
+        moe_hybridep_pad_uneven_dispatch_inputs=True,
+    )
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+    all_reduce = torch.distributed.all_reduce
+    collective_calls = []
+
+    def checked_all_reduce(tensor, op=None, group=None):
+        assert not torch.compiler.is_compiling(), 'Metadata collective entered compilation'
+        collective_calls.append(1)
+        return all_reduce(tensor, op=op, group=group)
+
+    monkeypatch.setattr(torch.distributed, 'all_reduce', checked_all_reduce)
+
+    @torch.compile
+    def compiled_preprocess(routing, probabilities):
+        manager.setup_metadata(routing, probabilities * 2)
+        return manager.token_probs + 1
+
+    # First compile, a changed shape, then replay a cached shape. Local sizes
+    # differ across ranks while every actual MAX collective executes once.
+    for lengths in (
+        (17 + 13 * rank for rank in range(group.size())),
+        (41 + 7 * rank for rank in reversed(range(group.size()))),
+        (17 + 13 * rank for rank in range(group.size())),
+    ):
+        lengths = tuple(lengths)
+        local = lengths[group.rank()]
+        expected = max(lengths)
+        expected += -expected % HYBRIDEP_TOKEN_ALIGNMENT
+        routing = torch.ones((local, manager.num_experts), device='cuda', dtype=torch.bool)
+        probabilities = torch.ones((local, manager.num_experts), device='cuda')
+        output = compiled_preprocess(routing, probabilities)
+        assert output.shape == (expected, manager.num_experts)
+        assert (output[:local] == 3).all()
+        assert (output[local:] == 1).all()
+    assert len(collective_calls) == 3
+
+
 @pytest.mark.skipif(
     not is_deep_ep_available() and not is_hybrid_ep_available(),
     reason="Deep EP and Hybrid EP are not available",

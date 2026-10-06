@@ -221,3 +221,210 @@ def test_cp2_cp4_parameter_gradients_match_cp1(cp_groups, case, num_layers, deri
         for expected_grad, actual_grad in zip(reference, actual):
             assert torch.isfinite(actual_grad).all()
             torch.testing.assert_close(actual_grad, expected_grad, atol=2e-7, rtol=2e-5)
+
+
+def _repacking_fixture(device, input_mask_case):
+    logical_lengths = (5, 9, 7)
+    physical_lengths = (8, 16, 8)
+    masks = []
+    conditioning = []
+    for sample, (logical, physical) in enumerate(zip(logical_lengths, physical_lengths)):
+        mask = torch.zeros(1, physical, device=device)
+        mask[0, (0, 6, 1)[sample] : logical - 1] = 1
+        input_mask = torch.ones_like(mask, dtype=torch.bool)
+        input_mask[0, logical:] = False
+        if input_mask_case == "holes":
+            input_mask[0, (1, 7, 4)[sample]] = False
+        elif input_mask_case == "zero":
+            input_mask.zero_()
+        masks.append(mask)
+        conditioning.append(input_mask)
+    return logical_lengths, physical_lengths, masks, conditioning
+
+
+@pytest.mark.parametrize("input_mask_case", ["none", "holes", "zero"])
+@pytest.mark.parametrize("num_layers", [1, 3])
+def test_step_global_mtp_counts_match_independent_boundary_reference(input_mask_case, num_layers):
+    """Count original samples without copying the production rolling algorithm."""
+    logical, physical, masks, conditioning = _repacking_fixture("cpu", input_mask_case)
+    expected = torch.zeros(num_layers + 1)
+    actual = torch.zeros_like(expected)
+    for length, padded, mask, valid in zip(logical, physical, masks, conditioning):
+        params = PackedSeqParams(
+            cu_seqlens_q=torch.tensor([0, length], dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor([0, padded], dtype=torch.int32),
+        )
+        actual += mtp.get_mtp_loss_token_counts(
+            mask,
+            num_layers,
+            mtp_input_mask=valid if input_mask_case != "none" else None,
+            packed_seq_params=params,
+        )
+        expected[0] += mask.sum()
+        for depth in range(1, num_layers + 1):
+            for token in range(max(length - depth, 0)):
+                if input_mask_case == "none" or bool(valid[0, token + 1 : token + depth + 1].all()):
+                    expected[depth] += mask[0, token + depth]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("input_mask_case", ["none", "holes", "zero"])
+@pytest.mark.parametrize("num_layers", [1, 3])
+def test_step_global_mtp_gradients_are_invariant_to_repacking_and_cp(
+    cp_groups, input_mask_case, num_layers
+):
+    """Real rolling, cross entropy and parameter gradients across reordered CP1/2/4 packs."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    logical, physical, masks, conditioning = _repacking_fixture(device, input_mask_case)
+    boundaries = torch.tensor([0, *physical], dtype=torch.int32, device=device).cumsum(
+        0, dtype=torch.int32
+    )
+    logical_boundaries = torch.tensor([0, *logical], dtype=torch.int32, device=device).cumsum(
+        0, dtype=torch.int32
+    )
+    full_mask = torch.cat(masks, dim=-1)
+    full_input_mask = torch.cat(conditioning, dim=-1) if input_mask_case != "none" else None
+    counts = mtp.get_mtp_loss_token_counts(
+        full_mask,
+        num_layers,
+        mtp_input_mask=full_input_mask,
+        packed_seq_params=PackedSeqParams(
+            cu_seqlens_q=logical_boundaries, cu_seqlens_q_padded=boundaries
+        ),
+    )
+    token_count = sum(physical)
+
+    def execute(schedule, use_global_counts=True):
+        # Isolate normalization from TF32 GEMM precision changes at different pack sizes.
+        head_total = torch.zeros(5, 4, device=device, dtype=torch.float64)
+        hidden_total = torch.zeros(
+            num_layers + 1, token_count, 1, 4, device=device, dtype=torch.float64
+        )
+        for sample_ids, cp_size in schedule:
+            group = cp_groups[cp_size]
+            head = torch.nn.Parameter(
+                torch.arange(20, device=device, dtype=torch.float64).reshape(5, 4) / 20
+            )
+            hidden = torch.nn.Parameter(
+                torch.arange((num_layers + 1) * token_count * 4, device=device, dtype=torch.float64)
+                .reshape_as(hidden_total)
+                .remainder(19)
+                / 19
+            )
+            indices = torch.cat(
+                [
+                    torch.arange(boundaries[sample], boundaries[sample + 1], device=device)
+                    .reshape(2 * cp_size, -1)[[group.rank(), 2 * cp_size - group.rank() - 1]]
+                    .reshape(-1)
+                    for sample in sample_ids
+                ]
+            )
+            packed = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=torch.tensor(
+                    [0, *[logical[sample] for sample in sample_ids]],
+                    dtype=torch.int32,
+                    device=device,
+                ).cumsum(0, dtype=torch.int32),
+                cu_seqlens_q_padded=torch.tensor(
+                    [0, *[physical[sample] for sample in sample_ids]],
+                    dtype=torch.int32,
+                    device=device,
+                ).cumsum(0, dtype=torch.int32),
+                local_cp_size=cp_size,
+                cp_group=group,
+                mtp_loss_token_counts=counts if use_global_counts else None,
+            )
+            labels = torch.arange(token_count, device=device).remainder(5).unsqueeze(0)
+            result = mtp.process_mtp_loss(
+                hidden_states=hidden[:, indices].reshape(-1, 1, 4),
+                labels=labels[:, indices],
+                loss_mask=full_mask[:, indices],
+                mtp_input_mask=full_input_mask[:, indices] if full_input_mask is not None else None,
+                output_layer=lambda value, **kwargs: (F.linear(value, head), None),
+                output_weight=None,
+                runtime_gather_output=True,
+                is_training=False,
+                compute_language_model_loss=lambda labels, logits: F.cross_entropy(
+                    logits.transpose(0, 1).reshape(-1, 5), labels.reshape(-1), reduction="none"
+                ).reshape_as(labels),
+                config=_config(num_layers=num_layers),
+                cp_group=cp_groups[1],
+                packed_seq_params=packed,
+            )
+            (result.sum() * 0).backward()
+            for gradient in (head.grad, hidden.grad):
+                torch.distributed.all_reduce(gradient, group=group)
+            head_total += head.grad / counts[0]
+            hidden_total += hidden.grad / counts[0]
+        return head_total, hidden_total
+
+    reference = execute([((0, 1, 2), 1)])
+    candidate = execute([((2,), 4), ((1, 0), 2)])
+    for expected, actual in zip(reference, candidate):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, atol=2e-7, rtol=2e-5)
+        if input_mask_case == "zero":
+            assert torch.count_nonzero(actual) == 0
+    if input_mask_case == "none":
+        # The same counterexample must detect the original per-pack normalization.
+        legacy = execute([((2,), 4), ((1, 0), 2)], use_global_counts=False)
+        assert not torch.allclose(legacy[0], reference[0], atol=2e-7, rtol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "counts,per_token,message",
+    [(torch.ones(1), True, "every MTP depth"), (torch.ones(2), False, "calculate_per_token_loss")],
+)
+def test_step_global_mtp_counts_validate_contract(counts, per_token, message):
+    with pytest.raises(ValueError, match=message):
+        mtp.process_mtp_loss(
+            hidden_states=torch.ones(8, 1, 1),
+            labels=torch.zeros(1, 4, dtype=torch.long),
+            loss_mask=torch.ones(1, 4),
+            output_layer=lambda value, **kwargs: (value, None),
+            output_weight=None,
+            runtime_gather_output=True,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.squeeze(-1).transpose(0, 1),
+            config=_config(per_token=per_token),
+            packed_seq_params=PackedSeqParams(mtp_loss_token_counts=counts),
+        )
+
+
+def test_mtp_padding_stays_masked_across_packed_cp_boundaries(cp_groups):
+    """Shifted conditioning beyond a document or inside its gap never routes to MoE."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    positions = torch.arange(16, device=device).unsqueeze(0)
+    full_padding = ((positions >= 5) & (positions < 8)) | (positions >= 14)
+    for cp_size in (1, 2, 4):
+        group = cp_groups[cp_size]
+        indices = positions.reshape(2, 2 * cp_size, -1)[
+            :, [group.rank(), 2 * cp_size - group.rank() - 1]
+        ].reshape(-1)
+        packed = PackedSeqParams(
+            cu_seqlens_q=torch.tensor([0, 5, 11], dtype=torch.int32, device=device),
+            cu_seqlens_q_padded=torch.tensor([0, 8, 16], dtype=torch.int32, device=device),
+            local_cp_size=cp_size,
+            cp_group=group,
+        )
+        layer = SimpleNamespace(
+            cp_group=cp_groups[1],
+            config=SimpleNamespace(sequence_parallel=False, mtp_detach_heads=False),
+        )
+        local_positions = positions[:, indices]
+        actual = mtp.MultiTokenPredictionLayer._get_embeddings(
+            layer,
+            input_ids=local_positions,
+            position_ids=local_positions,
+            hidden_states=torch.zeros(len(indices), 1, 2, device=device),
+            embedding=lambda input_ids, position_ids: torch.zeros(
+                len(indices), 1, 2, device=device
+            ),
+            packed_seq_params=packed,
+            padding_mask=full_padding[:, indices],
+        )[2]
+        # Logical documents occupy [0,5) and [8,14). Each loses its last
+        # conditioning slot after the shift; all physical gaps remain padding.
+        expected = ((positions >= 4) & (positions < 8)) | (positions >= 13)
+        torch.testing.assert_close(actual, expected[:, indices], atol=0, rtol=0)

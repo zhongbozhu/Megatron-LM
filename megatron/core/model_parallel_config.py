@@ -137,6 +137,14 @@ class ModelParallelConfig:
     default_dynamic_cp: Packing-aware scheduler with per-microbatch CP group sizes.
     """
 
+    sequence_packing_data_adapter: Optional[Callable] = field(default=None, init=False, repr=False)
+    """Optional modality-aware adapter around the selected packing scheduler.
+
+    Called with ``(data_iterator, num_microbatches, scheduler, pg_collection)``.
+    Returns the same iterator, microbatch count, and sequence statistics as
+    ``scheduler.run``. The scheduler still owns pack and rank assignments.
+    """
+
     pad_packed_seq_alignment: int | Literal['max'] | None = None
     """Pad packed THD inputs to a CP-local multiple, or to max_seqlen_per_dp_cp_rank.
 
