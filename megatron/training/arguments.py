@@ -1562,6 +1562,14 @@ def validate_args(args, defaults={}):
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
+    # Explicit chat supervision is opt-in; preserve every legacy tokenizer default.
+    sft_loss_mode = getattr(args, "sft_loss_mode", None)
+    if sft_loss_mode is not None:
+        if args.tokenizer_type != "SFTTokenizer":
+            raise ValueError("--sft-loss-mode requires --tokenizer-type SFTTokenizer")
+        if args.sft_tokenizer_prompt_format != "default" or args.use_gigatoken:
+            raise ValueError("Explicit chat loss requires the default HF format without gigatoken")
+
     # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
     # because they are mutually-exclusive top-level dataset selectors that both
     # drive the packed-sequence (THD) path. These stay in validate_args: the

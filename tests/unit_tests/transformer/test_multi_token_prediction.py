@@ -1136,6 +1136,7 @@ class TestMultiTokenPredictionLayer:
 
         for reference_value, dynamic_value in zip(reference_result, dynamic_result, strict=True):
             torch.testing.assert_close(reference_value, dynamic_value)
+        compared_gradients = 0
         for (reference_name, reference_param), (dynamic_name, dynamic_param) in zip(
             reference_layer.named_parameters(), dynamic_layer.named_parameters(), strict=True
         ):
@@ -1152,6 +1153,8 @@ class TestMultiTokenPredictionLayer:
                     f"Mismatch in MTP runtime-CP gradient {param_name}: {msg}"
                 ),
             )
+            compared_gradients += 1
+        assert compared_gradients > 0, "MTP preprocessing did not produce any parameter gradients"
 
     def test_forward_propagates_rolled_padding_mask(self, monkeypatch):
         """Test forward passes rolled padding_mask to transformer path."""
