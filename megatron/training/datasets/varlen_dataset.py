@@ -13,18 +13,19 @@ Compared to :class:`SFTDataset`, this dataset adds:
 
   * **Multi-source loading** — accepts HuggingFace Hub repo ids
     (``owner/repo``), local ``.parquet`` files, and local ``.jsonl/.json``
-    files; the latter are parsed with the stdlib ``json`` module and built in
-    a single pyarrow pass to sidestep the per-chunk JSON schema inference
-    that fails when sample fields vary across rows.
+    files; local rows are accessed by byte offset without coercing nested
+    tool arguments into an Arrow schema or loading all trajectories into RAM.
 
-  * **Auto schema detection** — four input layouts are auto-detected by column
-    name. The three instruction-tuning layouts are normalized to the messages
+  * **Auto schema detection** — five input layouts are auto-detected by column
+    name. The four instruction-tuning layouts are normalized to the messages
     list format expected by the parent ``SFTDataset.__getitem__``; the
     ``pretrain-text`` fallback instead returns a raw string handled separately
     in :meth:`VarlenDataset.__getitem__`:
 
       * **openai-messages** — column ``messages`` (Llama post-training,
         HuggingFaceH4/no_robots, ...)
+      * **bridge-conversation** — column ``conversation`` containing
+        ``role``/``content`` turns from Bridge's materialized chat datasets.
       * **sharegpt** — column ``conversations`` (OpenOrca, Vicuna, ...)
       * **alpaca / dolly** — at least one of
         ``instruction|prompt|query|question`` + one of
@@ -50,6 +51,7 @@ Limitations (raise a clear ``ValueError`` instead of silently mishandling):
 
 import json
 import os
+from copy import deepcopy
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -58,6 +60,8 @@ import torch
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset
 from megatron.core.datasets.utils import Split
+from megatron.core.tokenizers.text.libraries.chat_sft import normalize_chat, truncate_chat
+from megatron.training.datasets.jsonl_rows import JsonlRows
 from megatron.training.datasets.sft_dataset import (
     IGNORE_INDEX,
     MockSFTDataset,
@@ -68,12 +72,8 @@ from megatron.training.datasets.sft_dataset import (
 from megatron.training.datasets.utils import load_json_arg
 
 # Field-name synonyms (probed in order; first non-empty wins).
-_INSTRUCTION_FIELDS: Tuple[str, ...] = (
-    "instruction", "prompt", "query", "question",
-)
-_OUTPUT_FIELDS: Tuple[str, ...] = (
-    "output", "response", "completion", "answer",
-)
+_INSTRUCTION_FIELDS: Tuple[str, ...] = ("instruction", "prompt", "query", "question")
+_OUTPUT_FIELDS: Tuple[str, ...] = ("output", "response", "completion", "answer")
 # Supplementary user-turn context: Stanford Alpaca's "input", Dolly's "context".
 _EXTRA_INPUT_FIELDS: Tuple[str, ...] = ("input", "context")
 
@@ -110,9 +110,7 @@ def _looks_like_hf_id(path: str) -> bool:
     return "/" in path
 
 
-def _first_present(
-    sample: Dict[str, Any], fields: Iterable[str]
-) -> Optional[str]:
+def _first_present(sample: Dict[str, Any], fields: Iterable[str]) -> Optional[str]:
     """Return the first non-empty string value among the given fields, or None."""
     for f in fields:
         v = sample.get(f)
@@ -120,8 +118,7 @@ def _first_present(
             continue
         if not isinstance(v, str):
             raise ValueError(
-                f"VarlenDataset: field '{f}' must be a string, "
-                f"got {type(v).__name__}."
+                f"VarlenDataset: field '{f}' must be a string, " f"got {type(v).__name__}."
             )
         return v
     return None
@@ -145,9 +142,7 @@ def _alpaca_to_messages(sample: Dict[str, Any]) -> List[Dict[str, str]]:
     instruction = _first_present(sample, _INSTRUCTION_FIELDS) or ""
     extra_input = _first_present(sample, _EXTRA_INPUT_FIELDS) or ""
     output = _first_present(sample, _OUTPUT_FIELDS) or ""
-    user_content = (
-        f"{instruction}\n\n{extra_input}" if extra_input else instruction
-    )
+    user_content = f"{instruction}\n\n{extra_input}" if extra_input else instruction
     return [
         {"role": "system", "content": ""},
         {"role": "user", "content": user_content},
@@ -193,6 +188,11 @@ def _messages_passthrough(sample: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
+def _bridge_conversation_to_messages(sample: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Adapt Bridge's singular key for legacy SFT prompt formats."""
+    return _messages_passthrough({"messages": sample["conversation"]})
+
+
 def _raw_text_loader(sample: Dict[str, Any]) -> str:
     """Return the ``text`` column unchanged for pretrain-style packed runs.
 
@@ -209,20 +209,20 @@ def _raw_text_loader(sample: Dict[str, Any]) -> str:
     return text
 
 
-def _select_converter(
-    column_names: List[str],
-) -> Tuple[Callable[[Dict[str, Any]], Any], str]:
+def _select_converter(column_names: List[str]) -> Tuple[Callable[[Dict[str, Any]], Any], str]:
     """Pick a sample converter based on dataset column names.
 
-    Priority (most explicit first): openai-messages > sharegpt > alpaca/dolly
-    > pretrain-text. ``pretrain-text`` is the fallback for datasets that
-    only carry a single ``text`` column (e.g. Dolma / OLMo midtraining
+    Priority (most explicit first): openai-messages > bridge-conversation >
+    sharegpt > alpaca/dolly > pretrain-text. ``pretrain-text`` is the fallback
+    for datasets that only carry a single ``text`` column (e.g. Dolma / OLMo midtraining
     corpora) — long-context pretraining packed through the same THD path
     as SFT.
     """
     cols = set(column_names)
     if "messages" in cols:
         return _messages_passthrough, "openai-messages"
+    if "conversation" in cols:
+        return _bridge_conversation_to_messages, "bridge-conversation"
     if "conversations" in cols:
         return _sharegpt_to_messages, "sharegpt"
     has_instr = any(f in cols for f in _INSTRUCTION_FIELDS)
@@ -237,6 +237,7 @@ def _select_converter(
         f"alpaca/dolly ({'|'.join(_INSTRUCTION_FIELDS)} + "
         f"{'|'.join(_OUTPUT_FIELDS)} [+ optional {'|'.join(_EXTRA_INPUT_FIELDS)}]), "
         "sharegpt (conversations), openai-messages (messages), "
+        "bridge-conversation (conversation), "
         "pretrain-text (text)."
     )
 
@@ -252,60 +253,99 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
       * Local ``.parquet`` — loaded via
         ``datasets.load_dataset("parquet", data_files=path, split="all")``;
         parquet's footer schema makes chunked loading safe.
-      * Otherwise local jsonl/json — parsed line-by-line with the stdlib
-        ``json`` module and built with ``Dataset.from_list``. We avoid
-        ``datasets.load_dataset("json", ...)`` for local files because its
-        pyarrow-based JSON reader infers schema per parallel chunk and fails
-        with ``CastError`` when the union of fields varies between rows
-        (e.g. LongAlpaca-12k); ``from_list`` unifies the schema over the
-        whole file in one pass.
+      * Otherwise local jsonl/json -- indexed by byte offset. Nested tool
+        schemas/arguments are decoded on demand without Arrow type coercion.
 
-    A per-sample converter is selected once at construction time based on
-    column names and applied at access time. The instruction-tuning schemas
+    The first record determines the descriptive schema name. Each record is
+    validated and its converter selected separately at access time. The instruction-tuning schemas
     convert to a messages list; the ``pretrain-text`` fallback returns the raw
     string instead.
     """
 
-    def __init__(self, dataset_path: str) -> None:
-        try:
-            from datasets import Dataset, load_dataset
-        except ImportError as exc:
-            raise ImportError(
-                "VarlenDataset requires the `datasets` library "
-                "(pip install datasets)."
-            ) from exc
-
+    def __init__(self, dataset_path: str, preserve_chat: bool = False) -> None:
+        self.preserve_chat = preserve_chat
+        if _looks_like_hf_id(dataset_path) or dataset_path.endswith(".parquet"):
+            from datasets import load_dataset
         if _looks_like_hf_id(dataset_path):
             self.dataset = load_dataset(dataset_path, split="train")
         elif dataset_path.endswith(".parquet"):
-            self.dataset = load_dataset(
-                "parquet", data_files=dataset_path, split="all"
-            )
+            self.dataset = load_dataset("parquet", data_files=dataset_path, split="all")
         else:
-            # Parse the jsonl with the stdlib and build the table in one
-            # pyarrow pass: datasets.load_dataset("json", ...) infers schema
-            # per parallel chunk and fails with CastError when the union of
-            # fields varies between rows (e.g. LongAlpaca-12k); building from
-            # the full record list sidesteps that without a pandas dependency.
-            with open(dataset_path) as f:
-                records = [json.loads(line) for line in f if line.strip()]
-            self.dataset = Dataset.from_list(records)
+            self.dataset = JsonlRows(dataset_path)
 
-        self._converter, self._schema_name = _select_converter(
-            list(self.dataset.column_names)
-        )
+        self._converter, self._schema_name = _select_converter(list(self.dataset.column_names))
 
     @property
     def schema_name(self) -> str:
-        """Detected schema name: ``alpaca`` / ``sharegpt`` / ``openai-messages`` /
-        ``pretrain-text`` (the raw ``text``-column fallback)."""
+        """Detected schema: ``alpaca``, ``sharegpt``, ``openai-messages``,
+        ``bridge-conversation``, or ``pretrain-text`` (raw ``text`` fallback).
+        """
         return self._schema_name
 
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> List[Dict[str, str]]:
-        return self._converter(self.dataset[idx])
+    def __getitem__(self, idx: int):
+        row = self.dataset[idx]
+        location = (
+            self.dataset.location(idx)
+            if isinstance(self.dataset, JsonlRows)
+            else f"dataset row {idx}"
+        )
+        try:
+            # Optional fields and even supported schemas can differ by row.
+            converter, schema = _select_converter(list(row))
+            if schema == "pretrain-text":
+                return converter(row)
+            if schema in ("openai-messages", "bridge-conversation"):
+                key = "messages" if schema == "openai-messages" else "conversation"
+                if self.preserve_chat:
+                    messages, tools = normalize_chat(row[key], row.get("tools"))
+                    result = {"messages": messages, "tools": tools}
+                    if "chat_template_kwargs" in row:
+                        result["chat_template_kwargs"] = deepcopy(row["chat_template_kwargs"])
+                    return result
+                raw = row[key]
+                if isinstance(raw, str):
+                    raw = json.loads(raw)
+                if (
+                    row.get("tools") is not None
+                    or any(
+                        isinstance(message, dict)
+                        and (message.get("tool_calls") is not None or "tool_call_id" in message)
+                        for message in raw
+                    )
+                    or row.get("chat_template_kwargs") is not None
+                ):
+                    raise ValueError(
+                        "Tool metadata/template controls require an explicit SFT loss mode"
+                    )
+                return converter({**row, key: raw})
+            if not self.preserve_chat:
+                return converter(row)
+            if schema == "sharegpt":
+                # Unlike legacy conversion, explicit chat neither invents a
+                # system message nor maps unknown speakers to the user role.
+                messages = []
+                for turn in row["conversations"]:
+                    role = _SHAREGPT_ROLE_MAP.get((turn.get("from") or "").lower())
+                    if role is None:
+                        raise ValueError("Unsupported ShareGPT speaker in explicit chat")
+                    message = deepcopy(turn)
+                    message.pop("from", None)
+                    message["role"] = role
+                    message["content"] = message.pop("value", None)
+                    messages.append(message)
+            else:
+                messages = converter(row)[1:]  # Alpaca's synthetic empty system turn.
+            messages, tools = normalize_chat(messages, row.get("tools"))
+            result = {"messages": messages, "tools": tools}
+            if "chat_template_kwargs" in row:
+                result["chat_template_kwargs"] = deepcopy(row["chat_template_kwargs"])
+            return result
+        except (ValueError, TypeError, KeyError) as error:
+            # Normalization errors identify fields, never dump whole records.
+            raise ValueError(f"{location}: {error}") from None
 
 
 class VarlenDataset(SFTDataset):
@@ -325,7 +365,8 @@ class VarlenDataset(SFTDataset):
     padding waste.
 
     Truncation: samples longer than ``config.sequence_length`` are truncated
-    on the right; an EOD token is appended if the truncation removed it.
+    on the right. Explicit assistant supervision preserves the original
+    targets rather than inventing an EOS at the truncation boundary.
     """
 
     def __init__(
@@ -344,12 +385,24 @@ class VarlenDataset(SFTDataset):
         return len(low_level_dataset)
 
     @staticmethod
-    def build_low_level_dataset(
-        dataset_path: str, config: GPTDatasetConfig
-    ) -> LowLevelDataset:
-        return VarlenLowLevelDataset(dataset_path)
+    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
+        return VarlenLowLevelDataset(
+            dataset_path, preserve_chat=getattr(config.tokenizer, "sft_loss_mode", None) is not None
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        try:
+            return self._get_sample(idx)
+        except ValueError as error:
+            source = getattr(self.dataset, "dataset", None)
+            if isinstance(source, JsonlRows):
+                row_index = int(self.indices[idx % len(self.indices)])
+                location = source.location(row_index)
+                if not str(error).startswith(location):
+                    raise ValueError(f"{location}: {error}") from None
+            raise
+
+    def _get_sample(self, idx: int) -> Dict[str, torch.Tensor]:
         tokenizer = self.config.tokenizer
         max_len = self.config.sequence_length
         # HuggingFaceTokenizer returns None for ``pad`` when the underlying
@@ -358,14 +411,15 @@ class VarlenDataset(SFTDataset):
         # for loss because loss_mask zeros pad positions out.
         eod = tokenizer.eod
         pad = tokenizer.pad if tokenizer.pad is not None else eod
-        assert eod is not None, (
-            "VarlenDataset requires the tokenizer to expose an EOD/EOS token id."
-        )
+        assert (
+            eod is not None
+        ), "VarlenDataset requires the tokenizer to expose an EOD/EOS token id."
 
         # 1. Pull a single item from the low-level dataset. For SFT schemas
         #    (alpaca / sharegpt / openai-messages) this is a messages list;
         #    for the pretrain-text schema it is a raw string.
         item = self.dataset[int(self.indices[idx % len(self.indices)])]
+        chat_mode = None if isinstance(item, str) else getattr(tokenizer, "sft_loss_mode", None)
 
         assert not self.config.reset_position_ids
         assert not self.config.create_attention_mask and not self.config.reset_attention_mask
@@ -378,6 +432,20 @@ class VarlenDataset(SFTDataset):
             ids = list(tokenizer.tokenize(item))
             tokens_list = ids
             targets_list = list(ids)
+        elif isinstance(item, dict):
+            template_kwargs = (
+                {"chat_template_kwargs": item["chat_template_kwargs"]}
+                if "chat_template_kwargs" in item
+                else {}
+            )
+            tokens, targets = tokenizer.tokenize_conversation(
+                item["messages"],
+                tools=item.get("tools"),
+                return_target=True,
+                add_generation_prompt=False,
+                **template_kwargs,
+            )
+            tokens_list, targets_list = tokens.tolist(), targets.tolist()
         else:
             tokens, targets = tokenizer.tokenize_conversation(
                 item, return_target=True, add_generation_prompt=False
@@ -385,29 +453,23 @@ class VarlenDataset(SFTDataset):
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
 
-        # 2b. Guard against an empty tokenization (e.g. a blank ``pretrain-text``
-        #     row where ``tokenizer.tokenize("")`` returns no ids). Represent it
-        #     as a single end-of-document token so the next-token shift still
-        #     yields a valid 1-token sample instead of raising on
-        #     ``tokens_list[-1]`` below or producing a zero-length sequence.
-        if len(tokens_list) == 0:
-            tokens_list = [eod, eod]
-            targets_list = [eod, eod]
-
-        # 3. Right-truncate to ``sequence_length + 1`` (we drop the last token
-        #    after the input/label shift below). Keep an EOD at the end so a
-        #    truncated assistant turn still has a valid stop token.
-        if len(tokens_list) > max_len + 1:
-            tokens_list = tokens_list[: max_len + 1]
-            targets_list = targets_list[: max_len + 1]
-            if tokens_list[-1] != eod:
-                tokens_list[-1] = eod
-                targets_list[-1] = eod
-
-        # 4. Ensure EOD is the last token (unconditional for short samples).
-        if tokens_list[-1] != eod:
-            tokens_list.append(eod)
-            targets_list.append(eod)
+        if chat_mode is not None:
+            tokens, targets = truncate_chat(tokens_list, targets_list, max_len, chat_mode)
+            tokens_list, targets_list = tokens.tolist(), targets.tolist()
+        else:
+            # Preserve raw-text and legacy SFT end-of-document behavior.
+            if not tokens_list:
+                tokens_list = [eod, eod]
+                targets_list = [eod, eod]
+            if len(tokens_list) > max_len + 1:
+                tokens_list = tokens_list[: max_len + 1]
+                targets_list = targets_list[: max_len + 1]
+                if tokens_list[-1] != eod:
+                    tokens_list[-1] = eod
+                    targets_list[-1] = eod
+            if tokens_list[-1] != eod and len(tokens_list) <= max_len:
+                tokens_list.append(eod)
+                targets_list.append(eod)
 
         valid_len = len(tokens_list) - 1
 
@@ -488,9 +550,7 @@ class MockVarlenDataset(MockSFTDataset):
     """
 
     @staticmethod
-    def build_low_level_dataset(
-        dataset_path: str, config: GPTDatasetConfig
-    ) -> LowLevelDataset:
+    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
         if config.varlen_mock_dataset_config_json is None:
             mock_config = {
                 "mode": "distribution",
