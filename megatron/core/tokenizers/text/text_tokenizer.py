@@ -120,7 +120,13 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         )
 
     def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+        self,
+        conversation: List[Dict],
+        return_target: bool,
+        add_generation_prompt: bool,
+        *,
+        tools=None,
+        chat_template_kwargs=None,
     ):
         """Convert a conversation to tokens. Needed for SFTTokenizer.
 
@@ -132,8 +138,9 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                     {"role": "user", "content": "something1"},
                     {"role": "assistant", "content": "something2"},
                 ]
-            return_target (bool): Return target tokens with system and assistant masked.
+            return_target (bool): Return targets using the configured loss policy.
             add_generation_prompt (bool): Add assistant prefix to the end.
+            chat_template_kwargs: Per-row template controls for explicit chat SFT.
         """
 
         if self.library == 'sft':
@@ -141,9 +148,16 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 conversation=conversation,
                 return_target=return_target,
                 add_generation_prompt=add_generation_prompt,
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
             )
         else:
             raise NotImplementedError("This method is supported only for SFTTokenizer.")
+
+    @property
+    def sft_loss_mode(self):
+        """Explicit chat supervision also enables structured varlen records."""
+        return getattr(self._tokenizer, "loss_mode", None)
 
     def tokenize_files(self, paths: str | list[str], field: str = "text") -> "ak.Array":
         """
