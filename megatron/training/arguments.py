@@ -1760,6 +1760,14 @@ def validate_args(args, defaults={}):
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
+    # Explicit chat supervision is opt-in; preserve every legacy tokenizer default.
+    sft_loss_mode = getattr(args, "sft_loss_mode", None)
+    if sft_loss_mode is not None:
+        if args.tokenizer_type != "SFTTokenizer":
+            raise ValueError("--sft-loss-mode requires --tokenizer-type SFTTokenizer")
+        if args.sft_tokenizer_prompt_format != "default" or args.use_gigatoken:
+            raise ValueError("Explicit chat loss requires the default HF format without gigatoken")
+
     # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
     # because they are mutually-exclusive top-level dataset selectors that both
     # drive the packed-sequence (THD) path. These stay in validate_args: the
@@ -3988,8 +3996,6 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
-    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
-                       help='SFT prompt format.')
     group.add_argument('--sft-mock-dataset-config-json', type=str, default=None,
                        help='This config provides the necessary information for the mock '
                        'dataset. Accepts either an inline JSON literal or a path to a JSON '

@@ -755,5 +755,12 @@ class TokenizerConfig:
     chat_template: Optional[str] = None
     """Custom chat template in jinja format for conversation formatting."""
 
+    sft_tokenizer_prompt_format: str = "nemotron-h-aligned"
+    """SFT template format; the literal 'default' selects the HF tokenizer's own template."""
+
+    sft_loss_mode: Optional[Literal["assistant", "full"]] = None
+    """HF chat supervision: assistant uses template generation masks; full uses all
+    rendered tokens. None preserves legacy SFT masking."""
+
     use_gigatoken: Optional[bool] = False
     """Whether to use faster implementation of tokenizers (gigatoken)"""

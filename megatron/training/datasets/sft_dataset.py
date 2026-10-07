@@ -12,6 +12,11 @@ import torch
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split
+from megatron.training.datasets.packed_sft_dataset import (
+    PackedSFTLowLevelDataset,
+    get_sft_padding_divisor,
+    packed_row_to_tensors,
+)
 from megatron.training.datasets.utils import load_json_arg
 
 IGNORE_INDEX = -100
@@ -73,6 +78,8 @@ class SFTDataset(MegatronDataset):
 
     @staticmethod
     def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
+        if dataset_path.lower().endswith((".parquet", ".pq")):
+            return PackedSFTLowLevelDataset(dataset_path)
         return SFTLowLevelDataset(dataset_path)
 
     def __len__(self) -> int:
@@ -101,22 +108,26 @@ class SFTDataset(MegatronDataset):
             cp_pad = cp_pad * dp_size if dynamic_cp else cp_pad
             divisor = cp_pad * tp_pad
         """
-        if self.config.dynamic_context_parallel:
-            # Dynamic CP: consider both CP and DP
-            cp_pad = self.config.data_parallel_size * self.config.context_parallel_size * 2
-        else:
-            # Standard CP: only consider CP
-            cp_pad = self.config.context_parallel_size * 2 if self.config.context_parallel_size > 1 else 1
-        tp_pad = self.config.sequence_parallel_size if self.config.sequence_parallel_size > 0 else 1
-        divisor = cp_pad * tp_pad
-        # TODO(tailaim): do we need to pad for FP8 execution?
-        # divisor = ((divisor + 15) // 16) * 16
-        return divisor
+        return get_sft_padding_divisor(
+            context_parallel_size=self.config.context_parallel_size,
+            data_parallel_size=self.config.data_parallel_size,
+            sequence_parallel_size=self.config.sequence_parallel_size,
+            dynamic_context_parallel=self.config.dynamic_context_parallel,
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
 
         tokenizer = self.config.tokenizer
         pack_length = self.config.sequence_length
+
+        if isinstance(self.dataset, PackedSFTLowLevelDataset):
+            row = self.dataset[int(self.indices[idx % len(self.indices)])]
+            return packed_row_to_tensors(
+                row,
+                pad_token_id=tokenizer.pad if tokenizer.pad is not None else tokenizer.eod,
+                padding_divisor=self.padding_divisor,
+                sequence_length=pack_length,
+            )
 
         merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
         split_conversations = self._split_conversations(merged_conversations)

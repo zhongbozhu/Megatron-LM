@@ -114,8 +114,11 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
 
       * **Pre-packed** (e.g. :class:`SFTDataset`): each sample carries a
         ``cu_seqlens`` tensor and the tokens of multiple sub-samples
-        concatenated together. We slice them apart and synthesize
-        ``original_seq_len`` / ``padded_seq_len`` from the cu_seqlens deltas.
+        concatenated together. Optional ``cu_seqlens_padded`` gives physical
+        storage offsets when there are alignment gaps. We slice physical
+        segments and derive ``original_seq_len`` from logical deltas and
+        ``padded_seq_len`` from physical deltas. Legacy inputs without the
+        padded offsets use ``cu_seqlens`` for both.
 
       * **Already unpacked** (e.g. :class:`VarlenDataset`): each sample is a
         single sub-sample that already carries ``padded_seq_len`` (and
@@ -173,10 +176,22 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
     original_seq_lens = []
     padded_seq_lens = []
     for sample in batch:
-        for sub_sample in range(sample["cu_seqlens"].shape[0] - 1):
+        logical = sample["cu_seqlens"]
+        physical = sample.get("cu_seqlens_padded", logical)
+        if logical.shape != physical.shape:
+            raise ValueError("Packed logical and physical boundaries must have the same shape")
+        if (
+            logical[0] != 0
+            or physical[0] != 0
+            or physical[-1] != sample["tokens"].numel()
+            or torch.any(logical.diff() < 0)
+            or torch.any(physical.diff() < logical.diff())
+        ):
+            raise ValueError("Invalid packed SFT logical/physical sequence boundaries")
+        for sub_sample in range(logical.shape[0] - 1):
             sub_sample_dict = {}
-            start_idx = sample["cu_seqlens"][sub_sample]
-            end_idx = sample["cu_seqlens"][sub_sample + 1]
+            start_idx = physical[sub_sample]
+            end_idx = physical[sub_sample + 1]
             if end_idx - start_idx == 0:
                 continue
             for key in ["tokens", "labels", "loss_mask", "position_ids"]:
@@ -185,12 +200,8 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
             # supervised targets and must not occupy a scheduled microbatch.
             if not torch.any(sub_sample_dict['loss_mask']):
                 continue
-            # Since sft_dataset.py does not provide cu_seqlens_original,
-            # we assume original_seq_len equals padded_seq_len here.
-            # Ideally the dataset should define the pre-padding seq_len.
-            seq_len = (end_idx - start_idx).item()
-            original_seq_lens.append(seq_len)
-            padded_seq_lens.append(seq_len)
+            original_seq_lens.append((logical[sub_sample + 1] - logical[sub_sample]).item())
+            padded_seq_lens.append((end_idx - start_idx).item())
             batch_unpacked.append(sub_sample_dict)
 
     # Single H2D transfer for all seq lens

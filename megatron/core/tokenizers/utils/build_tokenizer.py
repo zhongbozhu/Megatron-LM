@@ -95,6 +95,8 @@ def build_tokenizer(args, **kwargs):
         tokenizer_path = args.tokenizer_model
         kwargs['prompt_format'] = args.sft_tokenizer_prompt_format
         kwargs['use_gigatoken'] = args.use_gigatoken
+        kwargs['loss_mode'] = getattr(args, 'sft_loss_mode', None)
+        kwargs['chat_template'] = getattr(args, 'chat_template', None)
     elif args.tokenizer_type in ['NullTokenizer', 'NullMultimodalTokenizer']:
         tokenizer_library = (
             'null-text' if args.tokenizer_type == 'NullTokenizer' else 'null-multimodal'
