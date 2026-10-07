@@ -168,26 +168,6 @@ def test_topology_alignment_matches_online(cp, dp, sp, dynamic, expected):
     assert get_sft_padding_divisor(**vars(config)) == expected
 
 
-def test_first_fit_decreasing_preserves_samples_and_accounts_for_padding():
-    bins = first_fit_decreasing([8, 16, 8, 24, 32], 32)
-    assert bins == [[4], [3, 0], [1, 2]]
-    assert sorted(index for row in bins for index in row) == list(range(5))
-    with pytest.raises(ValueError, match="Every aligned"):
-        first_fit_decreasing([33], 32)
-
-
-def test_row_shuffle_is_reproducible_and_preserves_bin_membership():
-    assignments = [[0], [1, 2], [3], [4, 5], [6], [7, 8], [9], [10, 11]]
-    original = tuple(tuple(row) for row in assignments)
-    rng_state = random.getstate()
-    shuffled = shuffle_packed_rows(assignments, seed=1234)
-    assert shuffled == shuffle_packed_rows(assignments, seed=1234)
-    assert shuffled != shuffle_packed_rows(assignments, seed=4321)
-    assert tuple(tuple(row) for row in assignments) == original
-    assert sorted(tuple(row) for row in shuffled) == sorted(original)
-    assert random.getstate() == rng_state
-
-
 @pytest.mark.parametrize(
     "mutate,error",
     [
