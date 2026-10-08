@@ -221,3 +221,41 @@ def test_cp2_cp4_parameter_gradients_match_cp1(cp_groups, case, num_layers, deri
         for expected_grad, actual_grad in zip(reference, actual):
             assert torch.isfinite(actual_grad).all()
             torch.testing.assert_close(actual_grad, expected_grad, atol=2e-7, rtol=2e-5)
+
+
+def test_mtp_padding_stays_masked_across_packed_cp_boundaries(cp_groups):
+    """Shifted conditioning beyond a document or inside its gap never routes to MoE."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    positions = torch.arange(16, device=device).unsqueeze(0)
+    full_padding = ((positions >= 5) & (positions < 8)) | (positions >= 14)
+    for cp_size in (1, 2, 4):
+        group = cp_groups[cp_size]
+        indices = positions.reshape(2, 2 * cp_size, -1)[
+            :, [group.rank(), 2 * cp_size - group.rank() - 1]
+        ].reshape(-1)
+        packed = PackedSeqParams(
+            cu_seqlens_q=torch.tensor([0, 5, 11], dtype=torch.int32, device=device),
+            cu_seqlens_q_padded=torch.tensor([0, 8, 16], dtype=torch.int32, device=device),
+            local_cp_size=cp_size,
+            cp_group=group,
+        )
+        layer = SimpleNamespace(
+            cp_group=cp_groups[1],
+            config=SimpleNamespace(sequence_parallel=False, mtp_detach_heads=False),
+        )
+        local_positions = positions[:, indices]
+        actual = mtp.MultiTokenPredictionLayer._get_embeddings(
+            layer,
+            input_ids=local_positions,
+            position_ids=local_positions,
+            hidden_states=torch.zeros(len(indices), 1, 2, device=device),
+            embedding=lambda input_ids, position_ids: torch.zeros(
+                len(indices), 1, 2, device=device
+            ),
+            packed_seq_params=packed,
+            padding_mask=full_padding[:, indices],
+        )[2]
+        # Logical documents occupy [0,5) and [8,14). Each loses its last
+        # conditioning slot after the shift; all physical gaps remain padding.
+        expected = ((positions >= 4) & (positions < 8)) | (positions >= 13)
+        torch.testing.assert_close(actual, expected[:, indices], atol=0, rtol=0)

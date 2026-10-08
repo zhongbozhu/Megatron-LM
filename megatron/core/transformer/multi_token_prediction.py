@@ -1572,14 +1572,17 @@ class MultiTokenPredictionLayer(MegatronModule):
             return_sum=False,
         )
         if padding_mask is not None:
-            padding_mask, _ = roll_tensor(
-                padding_mask,
+            # roll_tensor zero-fills sequence ends and physical padding. Roll
+            # validity so these fabricated conditioning positions stay masked.
+            valid_tokens, _ = roll_tensor(
+                ~padding_mask,
                 shifts=-1,
                 dims=-1,
                 cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
             )
+            padding_mask = ~valid_tokens
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -1940,12 +1943,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
 
         if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
-            assert (
-                self.config.recompute_num_layers == 1
-            ), "recompute_num_layers must be 1 for MTP recompute"
+            # Each legacy MTP instance checkpoints its own single Transformer layer.
+            # The decoder's recompute_num_layers controls decoder chunks independently.
             with outer_quantization_context:
                 outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':
