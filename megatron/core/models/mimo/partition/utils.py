@@ -5,6 +5,7 @@ The adapter slices sequences across *context-parallel* ranks and can further
 scatter them across *sequence-parallel* ranks when sequence-parallelism is
 enabled.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from torch.distributed import ProcessGroup  # type: ignore[import-not-found]
 
 from megatron.core import tensor_parallel
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
@@ -93,6 +94,12 @@ class PartitionAdapter:
         """
         self.cfg = cfg
 
+    def uses_context_parallel(self, packed_seq_params: Optional[PackedSeqParams] = None) -> bool:
+        """Whether this microbatch uses CP, including runtime singleton groups."""
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            return get_pg_size(resolve_cp_group(self.cfg.cp_group, packed_seq_params)) > 1
+        return self.cfg.use_cp
+
     def shard(
         self,
         embeddings: Optional[torch.Tensor],
@@ -119,15 +126,17 @@ class PartitionAdapter:
         it cannot line up with the sharded sequence, so MIMO masks via a causal
         ``attn_mask_type`` or ``packed_seq_params`` (THD) instead.
         """
+        cp_group = resolve_cp_group(self.cfg.cp_group, packed_seq_params)
+        use_cp = self.uses_context_parallel(packed_seq_params)
         # Sanity-check the sequence length before sharding. Embeddings are sequence-first,
         # so the token sequence is dim 0.
         if embeddings is not None:
             shard_factor = None
 
-            if self.cfg.use_cp and self.cfg.seq_parallel:
-                shard_factor = get_pg_size(self.cfg.tp_group) * get_pg_size(self.cfg.cp_group) * 2
-            elif self.cfg.use_cp:
-                shard_factor = get_pg_size(self.cfg.cp_group) * 2
+            if use_cp and self.cfg.seq_parallel:
+                shard_factor = get_pg_size(self.cfg.tp_group) * get_pg_size(cp_group) * 2
+            elif use_cp:
+                shard_factor = get_pg_size(cp_group) * 2
             elif self.cfg.seq_parallel:
                 shard_factor = get_pg_size(self.cfg.tp_group)
 
@@ -146,7 +155,7 @@ class PartitionAdapter:
                         "== language_max_sequence_length"
                     )
 
-        if self.cfg.use_cp:
+        if use_cp:
             # CP shards batch-first (get_batch_on_this_cp_rank requirement): transpose
             # (S, B, H) -> (B, S, H) in, then the CP-local result back to (S/cp, B, H).
             if embeddings is not None:
@@ -197,8 +206,9 @@ class PartitionAdapter:
                 - loss_mask (Optional[torch.Tensor]): Possibly sharded loss mask. Shape: (B, S/cp)
                 - packed_seq_params (PackedSeqParams, optional): Updated packed sequence parameters.
         """
-        if not self.cfg.use_cp:
+        if not self.uses_context_parallel(packed_seq_params):
             return embeddings, labels, loss_mask, packed_seq_params
+        cp_group = resolve_cp_group(self.cfg.cp_group, packed_seq_params)
 
         # Distribute sequence across CP ranks
         batch = dict()
@@ -210,19 +220,24 @@ class PartitionAdapter:
             batch["loss_mask"] = loss_mask
 
         if packed_seq_params is None or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd':
-            batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=self.cfg.cp_group)
+            batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=cp_group)
         else:
             assert _HAVE_TEX and is_te_min_version("1.10.0"), (
                 "Please update Transformer Engine to >= 1.10 "
                 "to use Context Parallel with THD format data"
             )
-            assert self.cfg.cp_group is not None
-            cp_size = get_pg_size(self.cfg.cp_group)
-            cp_rank = get_pg_rank(self.cfg.cp_group)
+            assert cp_group is not None
+            cp_size = get_pg_size(cp_group)
+            cp_rank = get_pg_rank(cp_group)
+            index = None
             for key, data in batch.items():
-                index = tex.thd_get_partitioned_indices(
-                    packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
-                )
+                if index is None:
+                    cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+                    if cu_seqlens is None:
+                        cu_seqlens = packed_seq_params.cu_seqlens_q
+                    index = tex.thd_get_partitioned_indices(
+                        cu_seqlens, data.size(1), cp_size, cp_rank
+                    )
                 batch[key] = data.index_select(1, index)
 
         # Extract sharded tensors; embeddings stay in [B, S/cp, H]. shard() transposes

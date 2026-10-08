@@ -471,6 +471,83 @@ class TestMimoModel:
         mimo_model = self._make_vlm()
         assert mimo_model.partition_adapter is None
 
+    def test_external_modality_embeddings_keep_encoder_gradient(self):
+        """External boundaries skip encoding/legacy transport and retain the supplied graph."""
+        self.seq_len = 32
+        self.img_h = self.img_w = 32
+        model = self._make_vlm()
+        model.external_modality_transport = True
+        images = torch.rand(1, 3, self.img_h, self.img_w, device=self.device)
+        features = model.encode_modalities({"images": {"clip_encoder": {"x": images}}})
+        features['images'].retain_grad()
+        input_ids = torch.zeros(1, self.seq_len, dtype=torch.long, device=self.device)
+        count = features['images'].size(0)
+        input_ids[:, 3 : 3 + count] = self.special_token_ids['images']
+        padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        padding_mask[:, -4:] = True
+
+        def feature_loss(**kwargs):
+            assert kwargs['padding_mask'] is padding_mask
+            hidden_states = kwargs['decoder_input']
+            torch.testing.assert_close(hidden_states[3 : 3 + count, 0], features['images'])
+            return hidden_states.square().sum()
+
+        with (
+            patch.object(model, 'encode_modalities', side_effect=AssertionError("encoded twice")),
+            patch.object(
+                model, '_apply_colocated_comms', side_effect=AssertionError("transported twice")
+            ),
+            patch.object(model.language_model, 'forward', side_effect=feature_loss),
+        ):
+            output, _ = model(
+                input_ids,
+                position_ids=torch.arange(self.seq_len, device=self.device).unsqueeze(0),
+                modality_embeddings=features,
+                padding_mask=padding_mask,
+            )
+            output.backward()
+
+        assert set(features) == {'images'}  # The caller's mapping is not mutated with text.
+        torch.testing.assert_close(features['images'].grad, 2 * features['images'].detach())
+        assert any(
+            parameter.grad is not None and bool(parameter.grad.abs().sum() > 0)
+            for parameter in model.modality_submodules['images'].parameters()
+        )
+
+    def test_external_modality_input_contract(self):
+        model = self._make_vlm()
+        tokens = self._make_input_ids()
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            model(tokens, modality_inputs={}, modality_embeddings={})
+        with pytest.raises(ValueError, match="Unknown precomputed modalities"):
+            model(tokens, modality_embeddings={'text': torch.empty(0, self.hidden_size)})
+        model.external_modality_transport = True
+        with pytest.raises(ValueError, match="requires modality_embeddings"):
+            model(tokens)
+
+    def test_dynamic_cp_constructs_adapter_at_static_cp1(self):
+        config = MimoModelConfig(
+            language_model_spec=get_language_model_spec(64, 128, 32), modality_submodules_spec={}
+        )
+        config.language_model_spec.params['config'].dynamic_context_parallel = True
+        model = MimoModel(config, external_modality_transport=True)
+        assert model.partition_adapter is not None
+        assert model.colocated_comms == {}
+
+    def test_precomputed_features_require_all_placeholder_modalities(self):
+        model = self._make_vlm()
+        model.external_modality_transport = True
+        tokens = torch.zeros(1, 8, dtype=torch.long, device=self.device)
+        positions = torch.arange(8, device=self.device).unsqueeze(0)
+        with patch.object(model.language_model, 'forward', return_value=torch.ones(1)) as decoder:
+            model(tokens, position_ids=positions, modality_embeddings={})
+            decoder.assert_called_once()
+            tokens[0, 2] = self.special_token_ids['images']
+            with pytest.raises(ValueError, match="Missing precomputed embeddings for images"):
+                model(tokens, position_ids=positions, modality_embeddings={})
+            # Missing features are rejected before entering the decoder again.
+            decoder.assert_called_once()
+
     def test_forward_with_packing_kwargs(self):
         """Test that packing_kwargs builds PackedSeqParams with qkv_format='thd' and int32 seqlens."""
         from megatron.core.packed_seq_params import PackedSeqParams
@@ -514,6 +591,7 @@ class TestMimoModel:
         assert packed_seq_params.qkv_format == 'thd'
         assert packed_seq_params.cu_seqlens_q.dtype == torch.int32
         assert packed_seq_params.cu_seqlens_kv.dtype == torch.int32
+        assert packing_kwargs['cu_seqlens_q'].dtype == torch.int64
 
     def test_forward_with_partition_adapter(self):
         """MTP token metadata must use the same CP-local sequence as hidden states.
