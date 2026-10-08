@@ -898,9 +898,15 @@ def validate_args(args, defaults={}):
 
     # MTP validation
     if args.mtp_num_layers:
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
+        # The native Qwen VL provider supplies absolute CP-local multi-axis
+        # phases. MTP already rolls arbitrary leading position axes along -1.
+        native_mimo_mrope = (
+            args.position_embedding_type == "mrope"
+            and getattr(args, "model_provider", None) == "qwen35_native"
+        )
+        assert args.position_embedding_type in ("rope", "none") or native_mimo_mrope, (
             f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
+            + "The supported types are rope, none, and mrope for native Qwen3.5 MIMO."
         )
 
     if args.freeze_base_model_for_mtp:
@@ -1494,7 +1500,15 @@ def validate_args(args, defaults={}):
     if args.dynamic_context_parallel:
         assert not args.enable_cuda_graph, 'Dynamic context parallelism not supported with CUDA Graph'
         assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
-        assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
+        native_mimo_external = (
+            args.dataloader_type == 'external'
+            and getattr(args, 'model_provider', None) == 'qwen35_native'
+            and getattr(args, 'dataset_provider', None) == 'qwen35_native'
+        )
+        assert args.dataloader_type == 'single' or native_mimo_external, (
+            'Dynamic context parallelism requires the single dataloader or '
+            'the native MIMO external source-batch adapter'
+        )
         assert args.calculate_per_token_loss, 'Dynamic context parallelism must be used with --calculate-per-token-loss'
         if args.sequence_packing_scheduler is None:
             args.sequence_packing_scheduler = 'default_dynamic_cp'
