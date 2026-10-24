@@ -2941,6 +2941,11 @@ class GTPEmbeddingWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Reduce-scatter the gradient back to this rank's vocab-dim shard."""
         (weight,) = ctx.saved_tensors
+        # Embedding backward returns the weight dtype (typically BF16). Match
+        # DDP's accumulation dtype before reducing across GTP peers, otherwise
+        # the collective rounds once more before adding to an FP32 main_grad.
+        if grad_output.dtype != weight.main_grad.dtype:
+            grad_output = grad_output.to(weight.main_grad.dtype)
         return weight.wgrad_reduce_scatter(grad_output)
 
 
