@@ -375,6 +375,8 @@ def test_runtime_cp_switch_preserves_packed_positions_masks_and_gradients():
     tokens = torch.arange(16, device=device).unsqueeze(0)
     positions = torch.stack((tokens + 17, tokens * 3 + 41))
     padding = torch.tensor([[False] * 5 + [True] * 3 + [False] * 7 + [True]], device=device)
+    tokens = tokens.masked_fill(padding, 0)
+    embedding_table = torch.arange(1, 33, device=device).float().reshape(16, 2)
     labels = tokens + 101
     loss_mask = (~padding).float()
     mtp_mask = (tokens % 3 != 0) & ~padding
@@ -397,7 +399,7 @@ def test_runtime_cp_switch_preserves_packed_positions_masks_and_gradients():
             for size in [sizes[-1], *sizes, sizes[-1]]:
                 cp_group = groups[size]
                 cp_rank = cp_group.rank()
-                embeddings = torch.arange(32, device=device).float().reshape(16, 1, 2)
+                embeddings = torch.nn.functional.embedding(tokens, embedding_table).transpose(0, 1)
                 embeddings.requires_grad_()
                 result = adapter.partition(
                     embeddings,
@@ -448,11 +450,15 @@ def test_runtime_cp_switch_preserves_packed_positions_masks_and_gradients():
                     if layout == boundary:
                         boundary_indices = indices
                         expected_embeddings = embeddings[indices]
-                        if zero_padding:
-                            expected_embeddings = expected_embeddings.masked_fill(
-                                ~valid.T.unsqueeze(-1), 0
-                            )
                         torch.testing.assert_close(batch["decoder_input"], expected_embeddings)
+                        # MIMO embeds before CP; text-only embeds the already partitioned IDs.
+                        # Both must preserve token 0's nonzero embedding at existing padding.
+                        text_embeddings = torch.nn.functional.embedding(
+                            batch["tokens"], embedding_table
+                        ).transpose(0, 1)
+                        torch.testing.assert_close(
+                            batch["decoder_input"], text_embeddings, rtol=0, atol=0
+                        )
                 batch = result.get_batch()
                 (batch["decoder_input"] * (~batch["padding_mask"]).T.unsqueeze(-1)).sum().backward()
                 expected_gradient = torch.zeros_like(embeddings)
@@ -461,6 +467,29 @@ def test_runtime_cp_switch_preserves_packed_positions_masks_and_gradients():
                 )
                 torch.testing.assert_close(embeddings.grad, expected_gradient, rtol=0, atol=0)
                 assert adapter.cfg.cp_group is torch.distributed.group.WORLD
+            if boundary == "zigzag" and size > 1:
+                # Removing the final source padding row makes CP insert a new row. It has no
+                # source embedding and must stay zero instead of copying clamped index zero.
+                inserted = adapter.partition(
+                    embeddings[:-1],
+                    tokens[:, :-1],
+                    None,
+                    None,
+                    None,
+                    None,
+                    logical,
+                    torch.tensor([0, 8, 15], dtype=torch.int32, device=device),
+                    torch.tensor(8, dtype=torch.int32, device=device),
+                    cp_group=cp_group,
+                    tp_cp_group=cp_group,
+                )
+                expected = torch.cat((embeddings[:-1], torch.zeros_like(embeddings[:1])))
+                torch.testing.assert_close(
+                    inserted.get_batch()["decoder_input"],
+                    expected[boundary_indices],
+                    rtol=0,
+                    atol=0,
+                )
     finally:
         for group in groups.values():
             torch.distributed.destroy_process_group(group)

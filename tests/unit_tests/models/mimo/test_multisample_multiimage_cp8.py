@@ -208,13 +208,7 @@ def test_dynamic_cp_two_samples_five_images_share_cp8(runtime_cp_group):
         for part in (cp_rank, 2 * cp_size - 1 - cp_rank):
             owned.extend(range(offset + part * chunk, offset + (part + 1) * chunk))
         offset += length
-    _exact(
-        local,
-        [
-            expected[i] if identities[i][1] < _SAMPLES[identities[i][0]][1] else [0] * _WIDTH
-            for i in owned
-        ],
-    )
+    _exact(local, [expected[i] for i in owned])
     _exact(
         labels,
         [
