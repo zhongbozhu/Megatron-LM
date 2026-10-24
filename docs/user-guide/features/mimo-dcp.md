@@ -30,7 +30,8 @@ model does not load the packing/data-scheduler implementation.
 Every transport rank currently receives the same ordered mapping of source
 samples and media descriptors. Source token tensors must be available on each
 rank before preparation. This replicated-source contract is separate from
-encoder execution: only assigned media are decoded/processed/encoded locally.
+encoder execution: each producer encodes only its assigned media. CPU media
+preprocessing and materialization remain the caller's responsibility.
 Rank-local datasets such as Energon need an acquisition/materialization adapter
 before calling these APIs. The text-only reroute schema cannot carry arbitrary
 media tensors or descriptors.
@@ -126,6 +127,30 @@ Save checkpoints only at a complete source-step boundary. Pending transfers and
 encoder graphs are transient and are not checkpoint state. Native MTP and MoE
 auxiliary objectives retain their existing semantics; changing pack composition
 does not promise identical auxiliary losses.
+
+## Qwen3.5 VL example
+
+`examples/mimo/train.py` accepts `--model-provider qwen35_native` and
+`--dataset-provider qwen35_native` to use the packed adapter in the full native
+`pretrain()` loop. Supply the ordinary Qwen3.5-35B-A3B decoder configuration,
+`--mimo-hf-model` for a local tokenizer/processor snapshot, and `--mimo-manifest`
+for a CLEVR image-conversation manifest. The manifest references a JSONL records
+file and image paths relative to its directory. The adapter preserves complete
+conversations and excludes oversized samples instead of truncating them.
+
+Use `--mimo-pretrained-checkpoint` to import the initial VL weights; subsequent
+native checkpoints use the usual `--save` and `--load`. The source iterator
+resumes from consumed source samples, independently of the number of packed
+decoder rounds. `--mimo-vision-recompute` enables full recomputation of the
+27-layer vision tower; decoder recomputation remains independently configured.
+
+This provider requires TP=PP=1, encoder TP=CP=1, non-overlapped DDP, per-token
+loss, `--dataloader-type external`, and a sequence-packing scheduler. Encoder DP
+spans the decoder DP x CP domain. The GPT/GDN decoder uses the same zigzag layout
+for linear attention and standard attention; differing CP layouts require a
+separate model adapter. The CLEVR dataset currently provides one image per
+conversation and preprocesses source samples on every rank before assigning
+encoder work. The generic planner and transport also support multi-image packs.
 
 ## Validation
 

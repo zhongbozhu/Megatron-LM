@@ -801,9 +801,9 @@ def validate_args(args, defaults={}):
 
     # MTP validation
     if args.mtp_num_layers:
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
+        assert args.position_embedding_type in ("rope", "mrope", "none"), (
             f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
+            + "The supported position embedding types are rope, mrope and none."
         )
 
     if args.freeze_base_model_for_mtp:
@@ -1306,7 +1306,9 @@ def validate_args(args, defaults={}):
     if args.dynamic_context_parallel:
         assert args.cuda_graph_impl == "none", 'Dynamic context parallelism not supported with CUDA Graph'
         assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
-        assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
+        assert args.dataloader_type in ('single', 'external'), (
+            'Dynamic context parallelism requires a single or externally provided dataloader'
+        )
         assert args.calculate_per_token_loss, 'Dynamic context parallelism must be used with --calculate-per-token-loss'
         if args.sequence_packing_scheduler is None:
             args.sequence_packing_scheduler = 'default_dynamic_cp'
