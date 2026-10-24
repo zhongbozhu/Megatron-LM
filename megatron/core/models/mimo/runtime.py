@@ -1,8 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Explicit encoder-graph lifetime for colocated packed multimodal training."""
+"""Explicit encoder-graph lifetime for packed multimodal training."""
 
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 from torch.distributed import ProcessGroup
@@ -27,8 +27,16 @@ class MimoStepRuntime:
     source-step boundary; encoder graphs and pending transfers are not serialized.
     """
 
-    def __init__(self, transport_group: ProcessGroup) -> None:
-        self.bridge = PackFeatureBridge(transport_group)
+    def __init__(
+        self,
+        transport_group: ProcessGroup,
+        *,
+        producer_ranks: Optional[Sequence[int]] = None,
+        decoder_ranks: Optional[Sequence[int]] = None,
+    ) -> None:
+        self.bridge = PackFeatureBridge(
+            transport_group, producer_ranks=producer_ranks, decoder_ranks=decoder_ranks
+        )
         self._clear()
 
     def _clear(self) -> None:
@@ -65,7 +73,7 @@ class MimoStepRuntime:
             self.feature_gradient = torch.zeros_like(local_features, dtype=torch.float32)
 
     def route(
-        self, plans: Sequence[PackFeaturePlan], cp_group: ProcessGroup
+        self, plans: Sequence[PackFeaturePlan], cp_group: Optional[ProcessGroup] = None
     ) -> PackFeatureTransfer:
         """Route this round's features; never implicitly complete an earlier round."""
         if not self.active:

@@ -262,11 +262,20 @@ def prepare_source(source, *, producer_ranks, rank, device):
             raise ValueError("Image dimensions must be positive")
         tasks.append(MediaTask(item["image_id"], item["length"], (height * width) ** 2))
     assignments, slices = assign_media_to_producers(tasks, producer_ranks)
-    if rank not in assignments:
-        raise ValueError("This rank must belong to the encoder producer domain")
     by_id = {item["image_id"]: item for item in media}
-    local = [by_id[task.media_id] for task in assignments[rank]]
+    local = [by_id[task.media_id] for task in assignments.get(rank, ())]
     return source["samples"], slices, build_vision_inputs(local, device)
+
+
+def prepare_disagg_source(source, *, args, topology):
+    """Use the same image assignment with a producer domain separate from the decoder."""
+    ranks = sorted(rank for line in topology.grids["images"].get_rank_enum("pp") for rank in line)
+    return prepare_source(
+        source,
+        producer_ranks=ranks,
+        rank=torch.distributed.get_rank(),
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
 
 
 def train_valid_test_datasets_provider(*_args, **_kwargs):

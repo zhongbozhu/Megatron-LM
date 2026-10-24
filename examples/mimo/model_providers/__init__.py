@@ -28,6 +28,9 @@ class MimoProvider:
     special_token_ids: Callable
     build_communicator: Callable
     language_input_projection_specs: Mapping[str, Callable] = field(default_factory=dict)
+    train_valid_test_data_provider: Callable | None = None
+    prepare_source: Callable | None = None
+    initialize_model: Callable | None = None
 
 
 def resolve_provider(args: "argparse.Namespace") -> MimoProvider:
@@ -37,8 +40,12 @@ def resolve_provider(args: "argparse.Namespace") -> MimoProvider:
         NEMOTRON_MODEL_PROVIDER,
         nemotron_provider,
     )
+    from examples.mimo.model_providers.qwen35_native import qwen35_disagg_provider
 
-    providers = {NEMOTRON_MODEL_PROVIDER: nemotron_provider}
+    providers = {
+        NEMOTRON_MODEL_PROVIDER: nemotron_provider,
+        "qwen35_native": qwen35_disagg_provider,
+    }
     name = getattr(args, "model_provider", NEMOTRON_MODEL_PROVIDER)
     if name not in providers:
         raise ValueError(f"unknown --model-provider {name!r}; known: {sorted(providers)}")
