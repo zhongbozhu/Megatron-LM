@@ -5671,6 +5671,7 @@ def evaluate(
                             config,
                             eval_num_microbatches,
                             pg_collection=eval_pgc,
+                            allow_partial_batch=True,
                         )
                     )
                 except StopIteration:
