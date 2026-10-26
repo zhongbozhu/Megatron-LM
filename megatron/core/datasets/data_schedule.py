@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
 import enum
+import hashlib
+import json
 from typing import Any, Callable, Dict, Optional, Type
 
 import torch
@@ -8,17 +10,20 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.context_parallel import get_batches_on_this_cp_rank
 from megatron.core.datasets.data_schedule_utils import (
+    _get_global_seqlens_and_ids,
     align_sample_id_groups,
     broadcast_scalars,
     broadcast_tensor,
     build_packed_microbatches,
     create_data_iterator,
     get_batch_and_global_seqlens,
+    get_batch_and_local_seqlens,
     get_packed_sequence_alignment,
     next_hdp_group_packing_aware,
     pad_packed_batch_before_cp_slice,
     reroute_samples_to_dcp_ranks,
 )
+from megatron.core.datasets.gtp_dynamic_cp_scheduler import plan_joint_dynamic_cp
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import (
@@ -198,7 +203,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             num_to_move = multiple - remainder
             i = num_packed_sequence - 1
             while num_to_move > 0:
-                assert i > 0, "Not enough samples to move"
+                assert i >= 0, "Not enough samples to move"
                 if len(packed_id_groups[i]) > 1:
                     seq_id = packed_id_groups[i].pop()
                     packed_id_groups.append([seq_id])
@@ -455,8 +460,304 @@ scheduler_map: Dict[PackingSchedulerEnum, Type[BasePackingScheduler]] = {
 }
 
 
+def _joint_packing_error_gate(error, tp_group, pp_group, full_group, dev, phase):
+    """Propagate a TP0-local failure before peers enter the next packing phase."""
+    status = 0 if error is None else 1 if isinstance(error, StopIteration) else 2
+    failed = torch.tensor([status], dtype=torch.int32, device=dev)
+    if tp_group.rank() == 0:
+        torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX, group=full_group)
+        if pp_group.size() > 1:
+            torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+    broadcast_tensor(failed, torch.distributed.get_process_group_ranks(tp_group)[0], tp_group)
+    status = int(failed.item())
+    if status == 1:
+        # Full-dataset evaluation uses StopIteration to end collectively. Keep
+        # exhaustion distinct from malformed data or an infeasible schedule.
+        raise StopIteration("Joint GTP packed data exhausted") from error
+    if status:
+        message = f"Joint GTP sequence packing failed during {phase} on a participating rank"
+        if error is not None:
+            message += f": {error}"
+        raise RuntimeError(message) from error
+
+
+def _joint_cp_group_members(full_ranks, lane_rank_lists, cp_size, min_cp_size, dynamic_cp):
+    """Express existing fixed-GTP CP groups in full-data-group slot coordinates.
+
+    The lane lists come from actual process-group memberships. Their order is
+    the one used by ``create_dynamic_dp_cp_groups``; full-group rank adjacency
+    alone does not describe a runtime CP communicator under GTP.
+    """
+    slot_by_rank = {rank: slot for slot, rank in enumerate(full_ranks)}
+    lanes = sorted(set(tuple(lane) for lane in lane_rank_lists))
+    flattened = [rank for lane in lanes for rank in lane]
+    if len(flattened) != len(full_ranks) or set(flattened) != set(full_ranks):
+        raise ValueError("Fixed-GTP DPxCP lanes must partition the full data group")
+    groups = []
+    for lane in lanes:
+        sizes = (
+            parallel_state.get_valid_dynamic_context_parallel_group_sizes(len(lane))
+            if dynamic_cp
+            else [cp_size]
+        )
+        for size in sizes:
+            if size < min_cp_size or len(lane) % size:
+                continue
+            for start in range(0, len(lane), size):
+                groups.append(tuple(slot_by_rank[rank] for rank in lane[start : start + size]))
+    return tuple(groups)
+
+
+class GTPPackingScheduler(DpBalancedScheduler):
+    """Schedule globally across GTP data peers using the existing CP topology."""
+
+    def __init__(
+        self,
+        *args,
+        lane_group,
+        dynamic_cp,
+        min_cp_size=1,
+        pad_alignment=1,
+        pad_enabled=False,
+        allow_partial_batch=False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.lane_group = lane_group
+        self.is_dynamic_cp = dynamic_cp
+        self.min_cp_size = min_cp_size if dynamic_cp else self.cp_size
+        self.pad_alignment = pad_alignment
+        self.pad_enabled = pad_enabled
+        self.allow_partial_batch = allow_partial_batch
+        self.allowed_cp_groups = None
+
+    def get_groups_and_subsamples(self, sample_id_seqlens):
+        return plan_joint_dynamic_cp(
+            sample_id_seqlens,
+            total_ranks=self.dp_size * self.cp_size,
+            allowed_cp_groups=self.allowed_cp_groups,
+            max_seqlen_per_rank=self.max_seqlen_per_dp_cp_rank,
+            microbatch_group_size_per_vp_stage=self.microbatch_group_size_per_vp_stage,
+            pad_alignment=self.pad_alignment,
+            pad_enabled=self.pad_enabled,
+        )
+
+    def run(
+        self,
+        data_iterator,
+        num_microbatches,
+        dp_group,
+        tp_group,
+        pp_group,
+        dp_cp_group,
+        dev,
+        config,
+    ):
+        """Use phase boundaries so expected input/planning failures reach every rank."""
+        is_tp0 = tp_group.rank() == 0
+        new_samples = None
+        vpp_needs_data = None
+        batch = []
+        local_schema = None
+        error = None
+        if is_tp0:
+            try:
+                first_pp = pp_group.rank() == 0
+                last_pp = pp_group.rank() == pp_group.size() - 1
+                vpp_size = config.virtual_pipeline_model_parallel_size or 1
+                mtp_here = mtp_on_this_pipeline_rank(
+                    layout=getattr(config, 'pipeline_model_parallel_layout', None),
+                    mtp_num_layers=getattr(config, 'mtp_num_layers', None),
+                    ignore_virtual=True,
+                    pp_group=pp_group,
+                    vp_size=vpp_size,
+                )
+                if vpp_size > 1:
+                    if data_iterator is not None and len(data_iterator) != vpp_size:
+                        raise ValueError("Packed iterator count must match VPP size")
+                    if data_iterator is not None:
+                        data_iterator = next((it for it in data_iterator if it is not None), None)
+                    vpp_needs_data = [False] * vpp_size
+                    if first_pp:
+                        vpp_needs_data[0] = True
+                    if last_pp:
+                        vpp_needs_data[-1] = True
+                    if mtp_here:
+                        for vp_stage in range(vpp_size):
+                            vpp_needs_data[vp_stage] |= mtp_on_this_pipeline_rank(
+                                layout=getattr(config, 'pipeline_model_parallel_layout', None),
+                                mtp_num_layers=getattr(config, 'mtp_num_layers', None),
+                                ignore_virtual=False,
+                                vp_stage=vp_stage,
+                                pp_group=pp_group,
+                                vp_size=vpp_size,
+                            )
+                if data_iterator is None:
+                    raise ValueError("Joint GTP packing needs data on TP0 of every PP stage")
+                batch, local_seqlens, exhausted = get_batch_and_local_seqlens(
+                    data_iterator, num_microbatches, allow_partial_batch=True
+                )
+                if exhausted and not self.allow_partial_batch:
+                    raise ValueError("Training data exhausted before the requested global batch")
+                keys_to_keep = {'original_seq_len', 'padded_seq_len'}
+                if first_pp or mtp_here:
+                    keys_to_keep.update(('tokens', 'position_ids'))
+                if last_pp or mtp_here:
+                    keys_to_keep.update(('labels', 'loss_mask'))
+                for sample in batch:
+                    unsupported = set(sample) - set(self.get_required_sample_keys())
+                    if unsupported:
+                        raise ValueError(
+                            f"Joint GTP packing supports only text sample fields: {sorted(unsupported)}"
+                        )
+                    missing = set(self.get_required_sample_keys()) - set(sample)
+                    if missing:
+                        raise ValueError(f"Packed sample lacks required keys: {sorted(missing)}")
+                    physical = int(sample['padded_seq_len'].item())
+                    logical = int(sample['original_seq_len'].item())
+                    if physical <= 0 or not 0 <= logical <= physical:
+                        raise ValueError("Invalid packed logical/physical sequence lengths")
+                    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+                        if sample[key].numel() != physical:
+                            raise ValueError(f"Packed {key} length does not match padded_seq_len")
+                        expected_dtype = torch.float32 if key == 'loss_mask' else torch.int64
+                        if sample[key].dtype != expected_dtype:
+                            raise ValueError(f"Packed {key} must have dtype {expected_dtype}")
+                    for key in list(sample):
+                        if key not in keys_to_keep:
+                            del sample[key]
+                    schema = {
+                        key: torch.int64 if key.endswith('_seq_len') else sample[key].dtype
+                        for key in sorted(keys_to_keep)
+                    }
+                    if local_schema is not None and schema != local_schema:
+                        raise ValueError("Local packed samples have inconsistent field dtypes")
+                    local_schema = schema
+                lane_ranks = torch.distributed.get_process_group_ranks(self.lane_group)
+                full_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+            except Exception as exc:
+                error = exc
+        _joint_packing_error_gate(error, tp_group, pp_group, dp_cp_group, dev, "local fetch/unpack")
+
+        error = None
+        if is_tp0:
+            try:
+                nonempty = torch.tensor(
+                    [int(local_seqlens.numel() > 0)], dtype=torch.int32, device=dev
+                )
+                torch.distributed.all_reduce(
+                    nonempty, op=torch.distributed.ReduceOp.MAX, group=dp_cp_group
+                )
+                minimum = nonempty.clone()
+                if pp_group.size() > 1:
+                    torch.distributed.all_reduce(
+                        minimum, op=torch.distributed.ReduceOp.MIN, group=pp_group
+                    )
+                    torch.distributed.all_reduce(
+                        nonempty, op=torch.distributed.ReduceOp.MAX, group=pp_group
+                    )
+                if minimum.item() != nonempty.item():
+                    raise ValueError("Pipeline stages reached packed-data exhaustion differently")
+                if not nonempty.item():
+                    if self.allow_partial_batch:
+                        raise StopIteration("All packed evaluation sample owners are empty")
+                    raise ValueError("Training global batch contains no nonempty sequences")
+                global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
+                    _get_global_seqlens_and_ids(local_seqlens, dp_group)
+                )
+            except Exception as exc:
+                error = exc
+        _joint_packing_error_gate(error, tp_group, pp_group, dp_cp_group, dev, "length gathering")
+
+        error = None
+        if is_tp0:
+            try:
+                gathered = [None] * dp_cp_group.size()
+                torch.distributed.all_gather_object(
+                    gathered, (lane_ranks, local_schema), group=dp_cp_group
+                )
+                schemas = [schema for _, schema in gathered if schema is not None]
+                if not schemas or any(schema != schemas[0] for schema in schemas):
+                    raise ValueError("Packed data ranks have inconsistent field dtypes")
+                sample_dtypes = schemas[0]
+                self.allowed_cp_groups = _joint_cp_group_members(
+                    full_ranks,
+                    [lane for lane, _ in gathered],
+                    self.cp_size,
+                    self.min_cp_size,
+                    self.is_dynamic_cp,
+                )
+                sample_id_groups = self.get_groups_and_subsamples(global_id_seqlens)
+                signature = hashlib.sha256(
+                    json.dumps((global_id_seqlens, sample_id_groups)).encode()
+                ).hexdigest()
+            except Exception as exc:
+                error = exc
+        _joint_packing_error_gate(error, tp_group, pp_group, dp_cp_group, dev, "global planning")
+
+        # Each PP stage reads independently. A differing schedule would mismatch
+        # P2P shapes even when its microbatch count happened to be equal.
+        error = None
+        if is_tp0:
+            try:
+                data_signatures = [None] * dp_cp_group.size()
+                torch.distributed.all_gather_object(data_signatures, signature, group=dp_cp_group)
+                signatures = [None] * pp_group.size()
+                torch.distributed.all_gather_object(signatures, signature, group=pp_group)
+                if len(set(data_signatures)) != 1 or len(set(signatures)) != 1:
+                    raise ValueError(
+                        "Data/pipeline ranks produced different packed sample schedules"
+                    )
+            except Exception as exc:
+                error = exc
+        _joint_packing_error_gate(error, tp_group, pp_group, dp_cp_group, dev, "pipeline agreement")
+
+        error = None
+        if is_tp0:
+            try:
+                samples = reroute_samples_to_dcp_ranks(
+                    batch,
+                    global_ids_this_rank,
+                    global_id_seqlens,
+                    sample_id_groups,
+                    offsets,
+                    dp_group,
+                    dp_cp_group,
+                    sample_keys=keys_to_keep,
+                    sample_dtypes=sample_dtypes,
+                )
+                new_samples = build_packed_microbatches(
+                    samples, sample_id_groups, dp_cp_group.rank(), dev, self.is_dynamic_cp
+                )
+                # Full-data gathering already includes each GTP sample owner
+                # once. No extra GTP SUM or division by the packed round count.
+                metadata = [
+                    len(sample_id_groups),
+                    sum(seqlens_gathered),
+                    sum(length * length for length in seqlens_gathered),
+                ]
+            except Exception as exc:
+                error = exc
+        _joint_packing_error_gate(error, tp_group, pp_group, dp_cp_group, dev, "sample routing")
+        metadata = broadcast_scalars(
+            metadata if is_tp0 else [0, 0, 0], tp_group, dev, dtype=torch.float64
+        )
+        new_data_iterator = create_data_iterator(
+            new_samples,
+            tp_group,
+            config,
+            vpp_needs_data=vpp_needs_data,
+            is_dynamic_cp=self.is_dynamic_cp,
+        )
+        return new_data_iterator, int(metadata[0]), float(metadata[1]), float(metadata[2])
+
+
 def wrap_data_iterator(
-    data_iterator, config, num_microbatches, pg_collection: Optional[ProcessGroupCollection] = None
+    data_iterator,
+    config,
+    num_microbatches,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    allow_partial_batch: bool = False,
 ):
     """
     A wrapper function that wraps around an existing data_iterator
@@ -466,11 +767,16 @@ def wrap_data_iterator(
         data_iterator: The original data_iterator to wrap around
         config: The config object containing the max_seqlen_per_dp_cp_rank
         pg_collection: The process group collection.
+        allow_partial_batch: Keep a finite evaluation tail across GTP sample owners.
+            The legacy GTP-inactive path retains its existing exhaustion behavior.
     """
 
     if pg_collection is None:
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        dp_group = parallel_state.get_data_parallel_group()
+        # Compatibility fallback: match the GTP-excluding collection fields.
+        dp_cp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=False
+        )
+        dp_group = parallel_state.get_data_parallel_group(with_gtp_remat=False)
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
     else:
@@ -486,6 +792,20 @@ def wrap_data_iterator(
     ), "dp_cp_group, dp_group, tp_group must not be None when using sequence packing"
 
     dev = torch.cuda.current_device()
+    lane_group = dp_cp_group
+    joint_gtp = getattr(config, 'gtp_weight_remat_size', 1) > 1
+    if joint_gtp:
+        if config.gtp_remat_num_sequence_shards != 1:
+            raise ValueError("Joint GTP packing does not support GTP sequence sharding")
+        if pg_collection is None:
+            # Bootstrap compatibility path; production callers pass a collection.
+            dp_group = parallel_state.get_data_parallel_group(with_gtp_remat=True)
+            dp_cp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=True
+            )
+        else:
+            dp_group = pg_collection.dp_gtp_remat
+            dp_cp_group = pg_collection.dp_cp_gtp_remat
     dp_size = dp_group.size()
     cp_size = dp_cp_group.size() // dp_size
 
@@ -504,7 +824,17 @@ def wrap_data_iterator(
         if capacity < alignment:
             raise ValueError(f"Packed sequence capacity must fit alignment {alignment}")
 
-    scheduler = scheduler_map[scheduler_type](
+    scheduler_class = scheduler_map[scheduler_type]
+    if joint_gtp:
+        scheduler_class = GTPPackingScheduler
+        scheduler_kwargs.update(
+            lane_group=lane_group,
+            dynamic_cp=scheduler_type == PackingSchedulerEnum.DEFAULT_DYNAMIC_CP,
+            pad_alignment=alignment,
+            pad_enabled=pad_enabled,
+            allow_partial_batch=allow_partial_batch,
+        )
+    scheduler = scheduler_class(
         capacity,
         cp_size,
         dp_size,

@@ -396,6 +396,7 @@ def reroute_samples_to_dcp_ranks(
     dp_group,
     dp_cp_group,
     sample_keys=None,
+    sample_dtypes=None,
 ):
     """
     Reroutes the sub-samples to the correct rank after scheduling.
@@ -494,7 +495,11 @@ def reroute_samples_to_dcp_ranks(
             else torch.empty(
                 0,
                 device=torch.cuda.current_device(),
-                dtype=torch.float32 if key == 'loss_mask' else torch.int64,
+                dtype=(
+                    sample_dtypes[key]
+                    if sample_dtypes is not None
+                    else torch.float32 if key == 'loss_mask' else torch.int64
+                ),
             )
         )
         assert (
@@ -574,6 +579,38 @@ def build_packed_microbatches(
     return new_samples
 
 
+def get_batch_and_local_seqlens(data_iterator, num_microbatches, allow_partial_batch=False):
+    """Fetch and validate local samples without entering a distributed collective.
+
+    Joint GTP packing coordinates local errors before gathering lengths, so a
+    failing iterator cannot leave another data rank inside that gather.
+    """
+    batch_list = []
+    exhausted = False
+    for _ in range(num_microbatches):
+        try:
+            batch_list.append(next(data_iterator))
+        except StopIteration:
+            if not allow_partial_batch:
+                raise
+            exhausted = True
+            break
+    batch = []
+    for item in batch_list:
+        if isinstance(item, dict):
+            batch.append(item)
+        elif isinstance(item, list):
+            batch.extend(item)
+        else:
+            raise ValueError(f"Invalid item type: {type(item)}")
+
+    batch = _unpack_batch(batch)
+    subsample_seqlens = (
+        torch.cat([sample["padded_seq_len"] for sample in batch]) if batch else torch.empty(0)
+    ).to(dtype=torch.int32, device=torch.cuda.current_device())
+    return batch, subsample_seqlens, exhausted
+
+
 def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     """
     Get the batch and global sequence lengths.
@@ -607,27 +644,7 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
             the FLOPs accounting.
     """
 
-    batch_list = [next(data_iterator) for _ in range(num_microbatches)]
-
-    batch = []
-    for item in batch_list:
-        if isinstance(item, dict):
-            batch.append(item)
-        elif isinstance(item, list):
-            batch.extend(item)
-        else:
-            raise ValueError(f"Invalid item type: {type(item)}")
-
-    # in sft_dataset.py, sequences are already packed before rescheduling,
-    # so we need to unpack them here and repack after rescheduling.
-    # This is only to adapt to the current megatron-lm sft_dataset.
-    # If you implement your own dataset, just have __getitem__ return List[Dict]
-    # and this step can be skipped.
-    batch = _unpack_batch(batch)
-
-    subsample_seqlens = (
-        torch.cat([sample["padded_seq_len"] for sample in batch]) if batch else torch.empty(0)
-    ).to(dtype=torch.int32, device=torch.cuda.current_device())
+    batch, subsample_seqlens, _ = get_batch_and_local_seqlens(data_iterator, num_microbatches)
 
     global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
         _get_global_seqlens_and_ids(subsample_seqlens, dp_group)
