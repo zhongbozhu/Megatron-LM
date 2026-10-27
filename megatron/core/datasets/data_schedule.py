@@ -198,7 +198,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             num_to_move = multiple - remainder
             i = num_packed_sequence - 1
             while num_to_move > 0:
-                assert i > 0, "Not enough samples to move"
+                assert i >= 0, "Not enough samples to move"
                 if len(packed_id_groups[i]) > 1:
                     seq_id = packed_id_groups[i].pop()
                     packed_id_groups.append([seq_id])
@@ -468,14 +468,20 @@ def wrap_data_iterator(
         pg_collection: The process group collection.
     """
 
+    has_gtp = getattr(config, 'gtp_weight_remat_size', 1) > 1
+    if has_gtp and config.gtp_remat_num_sequence_shards != 1:
+        raise ValueError("Sequence packing does not support GTP sequence sharding")
     if pg_collection is None:
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        dp_group = parallel_state.get_data_parallel_group()
+        # Migration fallback: mirror the explicit collection's full data domain.
+        dp_cp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=has_gtp
+        )
+        dp_group = parallel_state.get_data_parallel_group(with_gtp_remat=has_gtp)
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
     else:
-        dp_cp_group = pg_collection.dp_cp
-        dp_group = pg_collection.dp
+        dp_cp_group = pg_collection.dp_cp_gtp_remat if has_gtp else pg_collection.dp_cp
+        dp_group = pg_collection.dp_gtp_remat if has_gtp else pg_collection.dp
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
     assert (
