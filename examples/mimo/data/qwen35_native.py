@@ -248,11 +248,11 @@ def build_vision_inputs(media, device):
 
 
 def prepare_source(source, *, producer_ranks, rank, device):
-    """Assign complete images independently of decoder packing, retaining row order.
+    """Assign images and defer materialization until their decoder round needs them.
 
-    The source batch is replicated across the colocated domain. Only this rank's
-    assigned patches are moved to the GPU. The core planner owns assignment and
-    projected-row offsets; image-area cost and preprocessing stay in this adapter.
+    Source patches remain on CPU. The returned callable packs only the requested
+    local media IDs, in their requested order. The core planner owns assignment
+    and projected-row offsets; image preprocessing stays in this adapter.
     """
     media = source["media"]
     tasks = []
@@ -265,8 +265,14 @@ def prepare_source(source, *, producer_ranks, rank, device):
     if rank not in assignments:
         raise ValueError("This rank must belong to the encoder producer domain")
     by_id = {item["image_id"]: item for item in media}
-    local = [by_id[task.media_id] for task in assignments[rank]]
-    return source["samples"], slices, build_vision_inputs(local, device)
+    local = {task.media_id: by_id[task.media_id] for task in assignments[rank]}
+
+    def encoder_inputs(media_ids):
+        if any(media_id not in local for media_id in media_ids):
+            raise ValueError("Requested media must belong to this encoder producer")
+        return build_vision_inputs([local[media_id] for media_id in media_ids], device)
+
+    return source["samples"], slices, encoder_inputs
 
 
 def train_valid_test_datasets_provider(*_args, **_kwargs):
