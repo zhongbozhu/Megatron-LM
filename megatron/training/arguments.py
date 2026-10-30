@@ -800,9 +800,9 @@ def validate_args(args, defaults={}):
 
     # MTP validation
     if args.mtp_num_layers:
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
+        assert args.position_embedding_type in ("rope", "mrope", "none"), (
             f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
+            + "The supported position embedding types are rope, mrope and none."
         )
 
     if args.freeze_base_model_for_mtp:
