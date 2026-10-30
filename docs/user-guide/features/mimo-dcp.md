@@ -262,6 +262,34 @@ separate model adapter. The CLEVR dataset currently provides one image per
 conversation and preprocesses source samples on every rank before assigning
 encoder work. The generic planner and transport also support multi-image packs.
 
+The E2E overlay includes `examples/mimo/scripts/run_qwen35_colocated_dcp.sh`.
+Run it once per node in an environment with the required Transformer Engine,
+HybridEP and Qwen3.5 processor dependencies. Set the cluster's HybridEP/NVLink
+environment separately; the script does not assume a particular fabric.
+
+```bash
+export MIMO_MANIFEST=/data/clevr/manifest.json
+export MIMO_HF_MODEL=/models/Qwen3.5-35B-A3B
+export MIMO_PRETRAINED_CHECKPOINT=/checkpoints/pretrained/iter_0000000
+export MIMO_OUTPUT_DIR=/checkpoints/mimo-dcp
+export NNODES=4 GPUS_PER_NODE=4 MASTER_ADDR="<rank-zero-host>"
+# NODE_RANK must differ on each node: 0, 1, 2, 3.
+NODE_RANK=0 EXIT_INTERVAL=25 bash examples/mimo/scripts/run_qwen35_colocated_dcp.sh
+# After all nodes exit at step 25, repeat the same launch on all nodes:
+NODE_RANK=0 MIMO_LOAD="$MIMO_OUTPUT_DIR" \
+  bash examples/mimo/scripts/run_qwen35_colocated_dcp.sh
+```
+
+Defaults are 16 colocated GPUs, encoder DP16, decoder TP1/PP1/CP8/DP2/EP16,
+BF16, native MoE auxiliary loss, MTP1, full decoder and vision recompute, GBS64,
+and 50 total steps. `SEQ_LENGTH=40960` is the source admission limit;
+131072 is only the positional capacity. The DCP per-rank cap is 8192 and does
+not imply that every rank is padded to that length. Set `MIMO_LAYOUT=static_cp`
+for the paired static CP8 run, using a separate output directory. `MIMO_LAYOUT=cp1`
+uses the source length as its default per-rank cap. For common-layout heldout
+evaluation, set `MIMO_LOAD`, `MIMO_LAYOUT=cp1`, and `EVAL_ITERS=4`, then append
+`--skip-train --no-load-optim`. No GTP/EGTP weight sharding is enabled.
+
 ## Validation
 
 Run distributed tests using the repository's standard torch distributed runner.
