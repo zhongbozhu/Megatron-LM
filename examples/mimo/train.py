@@ -34,7 +34,12 @@ from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder
 from utils.data_helpers import broadcast_nested_data_batch
 
+from examples.mimo.model_providers.qwen35_native import (
+    add_qwen35_native_args,
+    model_provider_qwen35_native,
+)
 from examples.mimo.training.args import add_mimo_dcp_args
+from examples.mimo.training.packed_step import PackedMimoStep
 from megatron.core.enums import ModelType
 from megatron.core.utils import unwrap_model
 
@@ -43,13 +48,23 @@ _MODEL_PROVIDERS = {
     "llava_vlm": model_provider_llava_vlm,
     "video_llava_vlm": partial(model_provider_llava_vlm, is_video_input=True),
     "llava_avlm": model_provider_llava_avlm,
+    "qwen35_native": model_provider_qwen35_native,
 }
+
+
+def qwen35_datasets_provider(*args, **kwargs):
+    """Load Qwen's processor dependencies only for the Qwen data provider."""
+    from examples.mimo.data.qwen35_native import train_valid_test_datasets_provider
+
+    return train_valid_test_datasets_provider(*args, **kwargs)
+
 
 _DATASET_PROVIDERS = {
     "mock": mock_train_valid_test_datasets_provider,
     "llava_vlm": llava_vlm_dataloader_provider,
     "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
     "llava_avlm": llava_avlm_dataloader_provider,
+    "qwen35_native": qwen35_datasets_provider,
 }
 
 
@@ -79,8 +94,8 @@ def add_mimo_args(parser):
     group = parser.add_argument_group('MIMO', 'MIMO specific arguments')
 
     # MIMO-specific parameters
-    group.add_argument('--dataset-provider', type=str, default='mock', help='Dataset provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]')
-    group.add_argument('--model-provider', type=str, default='mock', help='Model provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]')
+    group.add_argument('--dataset-provider', type=str, default='mock', choices=_DATASET_PROVIDERS)
+    group.add_argument('--model-provider', type=str, default='mock', choices=_MODEL_PROVIDERS)
 
     # mock dataloader related args
     # can control mock samples with total seq length and image seq length
@@ -103,6 +118,10 @@ def add_mimo_args(parser):
     group.add_argument('--language-model-checkpoint', type=str, default=None, help='Path to language model checkpoint to load')
     # energon dataloader related args
     group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
+    group.add_argument('--mimo-manifest', type=str, help='Image conversation manifest')
+    group.add_argument('--mimo-heldout-images', type=int, default=64)
+    group.add_argument('--mimo-data-split-seed', type=int, default=None)
+    add_qwen35_native_args(parser)
     
     return parser
 
@@ -231,7 +250,7 @@ def train_valid_test_datasets_provider(*provider_args, **provider_kwargs):
     runtime_args = get_args()
     try:
         dataset_provider = _DATASET_PROVIDERS[runtime_args.dataset_provider]
-        if runtime_args.dataset_provider != "mock":
+        if runtime_args.dataset_provider not in ("mock", "qwen35_native"):
             # Calculate max_seq_length from total_seq_length
             max_seq_length = runtime_args.total_seq_length
             print_rank_0(f"MIMO Training: Using max_seq_length = {max_seq_length} "
@@ -272,6 +291,34 @@ def model_provider(
     """
     runtime_args = get_args()
     pg_collection = framework_kwargs.get('pg_collection')
+
+    if runtime_args.model_provider == "qwen35_native":
+        from examples.mimo.data.qwen35_native import prepare_source
+
+        model = model_provider_qwen35_native(
+            pre_process=pre_process,
+            post_process=post_process,
+            config=framework_kwargs.get("config"),
+            pg_collection=pg_collection,
+        )
+        pg = model.pg_collection
+        adapter = PackedMimoStep(
+            model,
+            pg,
+            partial(
+                prepare_source,
+                producer_ranks=torch.distributed.get_process_group_ranks(pg.dp_cp),
+                rank=torch.distributed.get_rank(),
+                device=torch.device("cuda", torch.cuda.current_device()),
+            ),
+            modality_name="images",
+        )
+        adapter.install(
+            overlap_grad_reduce=runtime_args.overlap_grad_reduce,
+            overlap_param_gather=runtime_args.overlap_param_gather,
+            rerun_mode=runtime_args.rerun_mode,
+        )
+        return model
 
     try:
         builder_fn = _MODEL_PROVIDERS[runtime_args.model_provider]
