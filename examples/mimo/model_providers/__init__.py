@@ -43,7 +43,12 @@ def resolve_provider(args: "argparse.Namespace") -> MimoProvider:
         NEMOTRON_MODEL_PROVIDER,
         nemotron_provider,
     )
-    providers = {NEMOTRON_MODEL_PROVIDER: nemotron_provider}
+    from examples.mimo.model_providers.qwen35_native import qwen35_disagg_provider
+
+    providers = {
+        NEMOTRON_MODEL_PROVIDER: nemotron_provider,
+        "qwen35_native": qwen35_disagg_provider,
+    }
     name = getattr(args, "model_provider", NEMOTRON_MODEL_PROVIDER)
     if name not in providers:
         raise ValueError(f"unknown --model-provider {name!r}; known: {sorted(providers)}")

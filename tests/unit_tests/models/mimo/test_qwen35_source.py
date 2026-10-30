@@ -94,6 +94,12 @@ def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch, schedule):
     )
     assert (encoder_inputs([]) if per_round else encoder_inputs) == {}
     assert all(item["pixel_values"].device.type == "cpu" for item in media)
+    decoder_samples, decoder_slices, decoder_inputs = qwen35_native.prepare_source(
+        source, producer_ranks=range(4), rank=7, device="cpu", **source_kwargs
+    )
+    assert decoder_samples is samples
+    assert decoder_slices == slices
+    assert (decoder_inputs([]) if per_round else decoder_inputs) == {}
     assert samples["B"]["media_ids"] == [101, 9, 91]
 
 

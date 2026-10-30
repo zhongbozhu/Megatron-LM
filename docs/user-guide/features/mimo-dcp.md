@@ -304,6 +304,30 @@ uses the source length as its default per-rank cap. For common-layout heldout
 evaluation, set `MIMO_LOAD`, `MIMO_LAYOUT=cp1`, and `EVAL_ITERS=4`, then append
 `--skip-train --no-load-optim`. No GTP/EGTP weight sharding is enabled.
 
+For disaggregated placement, use `examples/mimo/scripts/run_qwen35_disagg_dcp.sh`.
+It reuses the same model, data, optimizer and checkpoint arguments while selecting
+`examples/mimo/pretrain_mimo.py --mimo-packed`. Its defaults are **5 nodes × 4 GPUs**:
+encoder ranks 0–3 (DP4) and decoder ranks 4–19 (TP1/PP1/CP8/DP2/EP16).
+Set `NNODES=5` explicitly if reusing an environment from the colocated launch.
+`ENCODER_DP` controls the leading encoder pool; decoder DP is derived from the
+remaining ranks and the selected CP size. DCP groups contain only decoder ranks.
+
+Use the same path variables shown above and a separate output directory:
+
+```bash
+export NNODES=5 MIMO_OUTPUT_DIR=/checkpoints/mimo-disagg-dcp
+# Run once per node, setting NODE_RANK to 0, 1, 2, 3, or 4.
+NODE_RANK=0 EXIT_INTERVAL=25 bash examples/mimo/scripts/run_qwen35_disagg_dcp.sh
+NODE_RANK=0 MIMO_LOAD="$MIMO_OUTPUT_DIR" \
+  bash examples/mimo/scripts/run_qwen35_disagg_dcp.sh
+```
+
+`MIMO_LAYOUT=static_cp` keeps E4/D16 and uses decoder static CP8; `MIMO_LAYOUT=cp1`
+keeps the same pools with decoder DP16 for common-layout evaluation. Encoder
+and decoder processes use the same replicated source stream, but only encoder
+ranks move their assigned image patches onto GPUs. The projector remains with
+the encoder. This changes placement, not the Qwen model or training objective.
+
 ## Validation
 
 Run distributed tests using the repository's standard torch distributed runner.

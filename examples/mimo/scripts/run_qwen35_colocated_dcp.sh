@@ -27,6 +27,26 @@ case "${layout}" in
     *) echo "MIMO_LAYOUT must be dcp, static_cp, or cp1" >&2; exit 2 ;;
 esac
 
+entrypoint=examples/mimo/train.py
+placement_args=(--dataset-provider qwen35_native)
+case "${MIMO_PLACEMENT:-colocated}" in
+    colocated) ;;
+    disagg)
+        entrypoint=examples/mimo/pretrain_mimo.py
+        encoder_dp=${ENCODER_DP:-4}
+        decoder_ranks=$(( ${NNODES:-4} * ${GPUS_PER_NODE:-4} - encoder_dp ))
+        if (( encoder_dp <= 0 || decoder_ranks <= 0 || cp_size <= 0 || decoder_ranks % cp_size )); then
+            echo "Disagg requires nonempty E/D pools and decoder ranks divisible by CP_SIZE" >&2
+            exit 2
+        fi
+        placement_args=(--mimo-packed --mimo-encoder-tp 1 --mimo-encoder-dp "${encoder_dp}"
+                        --mimo-llm-offset "${encoder_dp}" --mimo-llm-tp 1 --mimo-llm-pp 1
+                        --mimo-llm-cp "${cp_size}" --mimo-llm-dp "$((decoder_ranks / cp_size))"
+                        --mimo-llm-ep "${EP_SIZE:-16}" --mimo-llm-expt-tp 1)
+        ;;
+    *) echo "MIMO_PLACEMENT must be colocated or disagg" >&2; exit 2 ;;
+esac
+
 checkpoint_args=(--save "${MIMO_OUTPUT_DIR}" --save-interval "${SAVE_INTERVAL:-25}")
 if [[ -n ${MIMO_LOAD:-} ]]; then
     checkpoint_args+=(--load "${MIMO_LOAD}" --exit-on-missing-checkpoint
@@ -46,8 +66,7 @@ exec "${PYTHON:-python}" -u -m torch.distributed.run \
     --nnodes "${NNODES:-4}" --nproc-per-node "${GPUS_PER_NODE:-4}" \
     --node-rank "${NODE_RANK:-0}" --master-addr "${MASTER_ADDR:-localhost}" \
     --master-port "${MASTER_PORT:-29500}" --max-restarts 0 \
-    examples/mimo/train.py \
-    --model-provider qwen35_native --dataset-provider qwen35_native \
+    "${entrypoint}" --model-provider qwen35_native "${placement_args[@]}" \
     --mimo-manifest "${MIMO_MANIFEST}" --mimo-hf-model "${MIMO_HF_MODEL}" \
     --mimo-heldout-images "${HELDOUT_IMAGES:-512}" \
     --mimo-data-split-seed "${SPLIT_SEED:-20261002}" --mimo-vision-recompute \

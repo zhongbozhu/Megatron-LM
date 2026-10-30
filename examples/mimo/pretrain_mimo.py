@@ -16,6 +16,7 @@ from functools import partial
 
 from examples.mimo.model_providers import resolve_provider
 from examples.mimo.model_providers.nemotron_moe_vlm import add_model_provider_args
+from examples.mimo.model_providers.qwen35_native import add_qwen35_native_args
 from examples.mimo.training.args import (
     add_hetero_grid_args,
     add_mimo_dcp_args,
@@ -50,6 +51,10 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     parser = add_mimo_dcp_args(parser)
     parser = add_mock_data_args(parser)
     parser = add_encoder_prefetch_args(parser)
+    parser = add_qwen35_native_args(parser)
+    parser.add_argument("--mimo-manifest", type=str)
+    parser.add_argument("--mimo-heldout-images", type=int, default=64)
+    parser.add_argument("--mimo-data-split-seed", type=int, default=None)
     return parser
 
 

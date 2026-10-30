@@ -64,7 +64,7 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     provider = parser.add_argument_group("mimo model provider")
     provider.add_argument(
         "--model-provider",
-        choices=[NEMOTRON_MODEL_PROVIDER],
+        choices=[NEMOTRON_MODEL_PROVIDER, "qwen35_native"],
         default=NEMOTRON_MODEL_PROVIDER,
         help="Which MIMO model provider/preset to build.",
     )

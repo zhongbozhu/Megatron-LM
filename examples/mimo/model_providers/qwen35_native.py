@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Pretrained Qwen3.5-35B-A3B VL for the native colocated MIMO training entrypoint."""
+"""Pretrained Qwen3.5-35B-A3B VL for native colocated and disaggregated MIMO."""
 
 from copy import copy
 from pathlib import Path
@@ -110,24 +110,15 @@ def _load_pretrained(model, checkpoint):
     )
 
 
-def model_provider_qwen35_native(
-    pre_process=True, post_process=True, vp_stage=None, pg_collection=None, config=None
-):
-    """Build the full VL model using native CLI configuration and checkpointing."""
-    args = get_args()
-    if not pre_process or not post_process or args.pipeline_model_parallel_size != 1:
-        raise ValueError("The native colocated Qwen3.5 provider currently requires PP=1")
-    if args.tensor_model_parallel_size != 1:
-        raise ValueError("The native colocated Qwen3.5 provider currently requires TP=1")
+def _language_spec(args, config, pg):
+    """Share the native decoder and its position convention across placements."""
     if args.position_embedding_type != "mrope" or args.mrope_section != [11, 11, 10]:
         raise ValueError(
             "Qwen3.5 VL requires --position-embedding-type mrope --mrope-section 11 11 10"
         )
     if args.apply_rope_fusion:
         raise ValueError("Qwen3.5 VL's absolute mRoPE requires --no-rope-fusion")
-    pg = pg_collection or ProcessGroupCollection.use_mpu_process_groups()
-    config = config if config is not None else core_transformer_config_from_args(args)
-    language_spec = ModuleSpec(
+    return ModuleSpec(
         module=Qwen35NativeGPT,
         params=dict(
             config=config,
@@ -145,6 +136,37 @@ def model_provider_qwen35_native(
             pg_collection=pg,
         ),
     )
+
+
+def _vision_spec(args, config, encoder_pg):
+    """Build the same vision tower and merger on the supplied encoder domain."""
+    encoder = ModuleSpec(
+        module=Qwen35VisionModel,
+        params=dict(
+            transformer_config=qwen35_vision_config(config, recompute=args.mimo_vision_recompute),
+            output_size=config.hidden_size,
+            pg_collection=encoder_pg,
+        ),
+    )
+    return ModuleSpec(
+        module=VisionModalitySubmodules,
+        params={"pg_collection": encoder_pg},
+        submodules={"encoders": {"qwen35": encoder}},
+    )
+
+
+def model_provider_qwen35_native(
+    pre_process=True, post_process=True, vp_stage=None, pg_collection=None, config=None
+):
+    """Build the full VL model using native CLI configuration and checkpointing."""
+    args = get_args()
+    if not pre_process or not post_process or args.pipeline_model_parallel_size != 1:
+        raise ValueError("The native colocated Qwen3.5 provider currently requires PP=1")
+    if args.tensor_model_parallel_size != 1:
+        raise ValueError("The native colocated Qwen3.5 provider currently requires TP=1")
+    pg = pg_collection or ProcessGroupCollection.use_mpu_process_groups()
+    config = config if config is not None else core_transformer_config_from_args(args)
+    language_spec = _language_spec(args, config, pg)
     encoder_pg = copy(pg)
     for name in (
         "tp",
@@ -161,19 +183,7 @@ def model_provider_qwen35_native(
         setattr(encoder_pg, name, pg.tp)
     for name in ("dp", "dp_gtp_remat", "dp_cp", "dp_cp_gtp_remat", "expt_dp", "expt_dp_gtp_remat"):
         setattr(encoder_pg, name, pg.dp_cp)
-    encoder = ModuleSpec(
-        module=Qwen35VisionModel,
-        params=dict(
-            transformer_config=qwen35_vision_config(config, recompute=args.mimo_vision_recompute),
-            output_size=config.hidden_size,
-            pg_collection=encoder_pg,
-        ),
-    )
-    images = ModuleSpec(
-        module=VisionModalitySubmodules,
-        params={"pg_collection": encoder_pg},
-        submodules={"encoders": {"qwen35": encoder}},
-    )
+    images = _vision_spec(args, config, encoder_pg)
     model = MimoModel(
         MimoModelConfig(
             language_model_spec=language_spec,
@@ -191,3 +201,35 @@ def model_provider_qwen35_native(
     if args.mimo_pretrained_checkpoint and not args.load:
         _load_pretrained(model, args.mimo_pretrained_checkpoint)
     return model
+
+
+def qwen35_disagg_provider():
+    """Use the same model, source stream and weight import on disjoint E/D pools."""
+    from examples.mimo.data.qwen35_native import (
+        prepare_disagg_source,
+        train_valid_test_datasets_provider,
+    )
+    from examples.mimo.model_providers import MimoProvider
+
+    def language(args, pg, grid):
+        if not args.mimo_packed:
+            raise ValueError("The disaggregated Qwen provider requires --mimo-packed")
+        return _language_spec(args, core_transformer_config_from_args(args), pg)
+
+    def vision(args, pg, grid):
+        return _vision_spec(args, core_transformer_config_from_args(args), pg)
+
+    def initialize(model, args):
+        if args.mimo_pretrained_checkpoint and not args.load:
+            _load_pretrained(model, args.mimo_pretrained_checkpoint)
+
+    return MimoProvider(
+        encoder_module_names=("images",),
+        language_spec=language,
+        encoder_specs={"images": vision},
+        special_token_ids=lambda args: {"images": 248056},
+        build_communicator=lambda args, topology: None,
+        train_valid_test_data_provider=lambda args, topology: train_valid_test_datasets_provider(),
+        prepare_source=prepare_disagg_source,
+        initialize_model=initialize,
+    )
