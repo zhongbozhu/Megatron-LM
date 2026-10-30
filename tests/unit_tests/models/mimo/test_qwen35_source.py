@@ -13,7 +13,7 @@ from megatron import training
 from megatron.training import global_vars
 
 
-def test_qwen_image_assignment_preserves_thd_row_order():
+def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch):
     media = []
     for image_id, grid_size in (
         (91, (2, 2)),
@@ -36,19 +36,39 @@ def test_qwen_image_assignment_preserves_thd_row_order():
     source = dict(samples=samples, media=media)
     expected = {0: [27], 1: [4], 2: [91, 9], 3: [101]}
     by_id = {item["image_id"]: item for item in media}
+    materialized = []
+    build_vision_inputs = qwen35_native.build_vision_inputs
+
+    def observe_materialization(items, device):
+        materialized.append([item["image_id"] for item in items])
+        assert all(item["pixel_values"].device.type == "cpu" for item in items)
+        return build_vision_inputs(items, device)
+
+    monkeypatch.setattr(qwen35_native, "build_vision_inputs", observe_materialization)
     for rank, ids in expected.items():
-        actual_samples, slices, inputs = qwen35_native.prepare_source(
+        calls_before = len(materialized)
+        actual_samples, slices, encoder_inputs = qwen35_native.prepare_source(
             source, producer_ranks=range(4), rank=rank, device="cpu"
         )
         assert actual_samples is samples
-        vision = inputs["images"]["qwen35"]
-        torch.testing.assert_close(
-            vision["hidden_states"],
-            torch.cat([by_id[key]["pixel_values"] for key in ids]).bfloat16(),
-        )
-        torch.testing.assert_close(
-            vision["grid_thw"], torch.cat([by_id[key]["grid"] for key in ids])
-        )
+        assert len(materialized) == calls_before
+        for requested in (ids, ids[::-1], ids[1:], []):
+            inputs = encoder_inputs(requested)
+            assert materialized[-1] == requested
+            if not requested:
+                assert inputs == {}
+                continue
+            vision = inputs["images"]["qwen35"]
+            torch.testing.assert_close(
+                vision["hidden_states"],
+                torch.cat([by_id[key]["pixel_values"] for key in requested]).bfloat16(),
+            )
+            torch.testing.assert_close(
+                vision["grid_thw"], torch.cat([by_id[key]["grid"] for key in requested])
+            )
+        foreign_id = next(key for key in by_id if key not in ids)
+        with pytest.raises(ValueError, match="belong to this encoder producer"):
+            encoder_inputs([foreign_id])
         offset = 0
         for key in ids:
             assert (slices[key].producer_rank, slices[key].offset, slices[key].length) == (
@@ -57,10 +77,11 @@ def test_qwen_image_assignment_preserves_thd_row_order():
                 by_id[key]["length"],
             )
             offset += by_id[key]["length"]
-    _, _, inputs = qwen35_native.prepare_source(
+    _, _, encoder_inputs = qwen35_native.prepare_source(
         source, producer_ranks=range(8), rank=7, device="cpu"
     )
-    assert inputs == {}
+    assert encoder_inputs([]) == {}
+    assert all(item["pixel_values"].device.type == "cpu" for item in media)
     assert samples["B"]["media_ids"] == [101, 9, 91]
 
 
