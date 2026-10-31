@@ -284,6 +284,7 @@ def prepare_disagg_source(source, *, args, topology):
         producer_ranks=producers,
         rank=torch.distributed.get_rank(),
         device=torch.device("cuda", torch.cuda.current_device()),
+        per_round=args.mimo_dcp_encoder_schedule == "per-round",
     )
 
 
