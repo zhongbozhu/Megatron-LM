@@ -41,12 +41,6 @@ def add_qwen35_native_args(parser):
         action="store_true",
         help="Full uniform layer recompute for the independent Qwen vision encoder",
     )
-    group.add_argument(
-        "--mimo-lazy-encoder",
-        action="store_true",
-        help="Encode images on first decoder use and release graphs after their last use; "
-        "defaults to whole-step encoding. May reduce memory at a throughput cost.",
-    )
     return parser
 
 
