@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Qwen data adapter boundaries: image row order and native source resume."""
 
+from argparse import ArgumentParser
 from types import SimpleNamespace
 
 import pytest
@@ -9,11 +10,16 @@ import torch
 pytest.importorskip("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
 
 from examples.mimo.data import qwen35_native
+from examples.mimo.model_providers.qwen35_native import add_qwen35_native_args
 from megatron import training
 from megatron.training import global_vars
 
 
-def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch):
+@pytest.mark.parametrize("cli", ([], ["--mimo-lazy-encoder"]), ids=("eager-default", "lazy"))
+def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch, cli):
+    lazy_encoder = add_qwen35_native_args(ArgumentParser()).parse_args(cli).mimo_lazy_encoder
+    assert lazy_encoder is bool(cli)
+    source_kwargs = {"lazy_encoder": True} if lazy_encoder else {}
     media = []
     for image_id, grid_size in (
         (91, (2, 2)),
@@ -48,12 +54,13 @@ def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch):
     for rank, ids in expected.items():
         calls_before = len(materialized)
         actual_samples, slices, encoder_inputs = qwen35_native.prepare_source(
-            source, producer_ranks=range(4), rank=rank, device="cpu"
+            source, producer_ranks=range(4), rank=rank, device="cpu", **source_kwargs
         )
         assert actual_samples is samples
-        assert len(materialized) == calls_before
-        for requested in (ids, ids[::-1], ids[1:], []):
-            inputs = encoder_inputs(requested)
+        assert callable(encoder_inputs) is lazy_encoder
+        assert len(materialized) == calls_before + (not lazy_encoder)
+        for requested in (ids, ids[::-1], ids[1:], []) if lazy_encoder else (ids,):
+            inputs = encoder_inputs(requested) if lazy_encoder else encoder_inputs
             assert materialized[-1] == requested
             if not requested:
                 assert inputs == {}
@@ -66,9 +73,10 @@ def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch):
             torch.testing.assert_close(
                 vision["grid_thw"], torch.cat([by_id[key]["grid"] for key in requested])
             )
-        foreign_id = next(key for key in by_id if key not in ids)
-        with pytest.raises(ValueError, match="belong to this encoder producer"):
-            encoder_inputs([foreign_id])
+        if lazy_encoder:
+            foreign_id = next(key for key in by_id if key not in ids)
+            with pytest.raises(ValueError, match="belong to this encoder producer"):
+                encoder_inputs([foreign_id])
         offset = 0
         for key in ids:
             assert (slices[key].producer_rank, slices[key].offset, slices[key].length) == (
@@ -78,9 +86,9 @@ def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch):
             )
             offset += by_id[key]["length"]
     _, _, encoder_inputs = qwen35_native.prepare_source(
-        source, producer_ranks=range(8), rank=7, device="cpu"
+        source, producer_ranks=range(8), rank=7, device="cpu", **source_kwargs
     )
-    assert encoder_inputs([]) == {}
+    assert (encoder_inputs([]) if lazy_encoder else encoder_inputs) == {}
     assert all(item["pixel_values"].device.type == "cpu" for item in media)
     assert samples["B"]["media_ids"] == [101, 9, 91]
 
