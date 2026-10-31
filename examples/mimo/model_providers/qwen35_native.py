@@ -28,7 +28,7 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 
 def add_qwen35_native_args(parser):
-    """Only model-specific options; native arguments own all decoder settings."""
+    """Qwen MIMO provider options; native arguments own all decoder settings."""
     group = parser.add_argument_group("native Qwen3.5 MIMO")
     group.add_argument("--mimo-hf-model", type=str, help="Local HF tokenizer/processor snapshot")
     group.add_argument(
@@ -40,6 +40,12 @@ def add_qwen35_native_args(parser):
         "--mimo-vision-recompute",
         action="store_true",
         help="Full uniform layer recompute for the independent Qwen vision encoder",
+    )
+    group.add_argument(
+        "--mimo-lazy-encoder",
+        action="store_true",
+        help="Encode images on first decoder use and release graphs after their last use; "
+        "defaults to whole-step encoding. May reduce memory at a throughput cost.",
     )
     return parser
 

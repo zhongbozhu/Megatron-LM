@@ -247,12 +247,12 @@ def build_vision_inputs(media, device):
     }
 
 
-def prepare_source(source, *, producer_ranks, rank, device):
-    """Assign images and defer materialization until their decoder round needs them.
+def prepare_source(source, *, producer_ranks, rank, device, lazy_encoder=False):
+    """Assign images for whole-step encoding, or materialize them lazily on demand.
 
-    Source patches remain on CPU. The returned callable packs only the requested
-    local media IDs, in their requested order. The core planner owns assignment
-    and projected-row offsets; image preprocessing stays in this adapter.
+    Lazy mode retains source patches on CPU and returns a callable that packs
+    requested local media IDs in order. Both modes use the same producer
+    assignment, projected-row offsets and image preprocessing.
     """
     media = source["media"]
     tasks = []
@@ -272,7 +272,8 @@ def prepare_source(source, *, producer_ranks, rank, device):
             raise ValueError("Requested media must belong to this encoder producer")
         return build_vision_inputs([local[media_id] for media_id in media_ids], device)
 
-    return source["samples"], slices, encoder_inputs
+    inputs = encoder_inputs if lazy_encoder else encoder_inputs(list(local))
+    return source["samples"], slices, inputs
 
 
 def train_valid_test_datasets_provider(*_args, **_kwargs):
