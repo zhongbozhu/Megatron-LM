@@ -254,17 +254,18 @@ resumes from consumed source samples, independently of the number of packed
 decoder rounds. `--mimo-vision-recompute` enables full recomputation of the
 27-layer vision tower; decoder recomputation remains independently configured.
 
-Whole-step encoder execution is the default. Add `--mimo-lazy-encoder` to encode
+Whole-step encoder execution is the default. Use
+`--mimo-dcp-encoder-schedule per-round` to encode
 images on their first consuming decoder round and release their graphs after
 the last consumer. This trades encoder batching efficiency for shorter graph
 lifetimes; it does not overlap encoder and decoder computation on colocated GPUs.
 In a 16-GPU Qwen3.5 validation with full vision recompute and about four images
-per producer, lazy execution reduced the peak PyTorch allocation by about
+per producer, per-round execution reduced the peak PyTorch allocation by about
 0.09 GiB but increased steady-state step time by 2.3%. Measure the tradeoff for
-your workload before enabling it. The example launcher forwards this flag:
+your workload before enabling it. The example launcher forwards this option:
 
 ```bash
-bash examples/mimo/scripts/run_qwen35_colocated_dcp.sh --mimo-lazy-encoder
+bash examples/mimo/scripts/run_qwen35_colocated_dcp.sh --mimo-dcp-encoder-schedule per-round
 ```
 
 This provider requires TP=PP=1, encoder TP=CP=1, non-overlapped DDP, per-token

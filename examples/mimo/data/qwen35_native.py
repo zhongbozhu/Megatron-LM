@@ -247,7 +247,7 @@ def build_vision_inputs(media, device):
     }
 
 
-def prepare_source(source, *, producer_ranks, rank, device, lazy_encoder=False):
+def prepare_source(source, *, producer_ranks, rank, device, per_round=False):
     """Assign images for whole-step encoding, or materialize them lazily on demand.
 
     Lazy mode retains source patches on CPU and returns a callable that packs
@@ -272,7 +272,7 @@ def prepare_source(source, *, producer_ranks, rank, device, lazy_encoder=False):
             raise ValueError("Requested media must belong to this encoder producer")
         return build_vision_inputs([local[media_id] for media_id in media_ids], device)
 
-    inputs = encoder_inputs if lazy_encoder else encoder_inputs(list(local))
+    inputs = encoder_inputs if per_round else encoder_inputs(list(local))
     return source["samples"], slices, inputs
 
 
