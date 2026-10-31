@@ -10,16 +10,20 @@ import torch
 pytest.importorskip("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
 
 from examples.mimo.data import qwen35_native
-from examples.mimo.model_providers.qwen35_native import add_qwen35_native_args
+from examples.mimo.training.args import add_mimo_dcp_args
 from megatron import training
 from megatron.training import global_vars
 
 
-@pytest.mark.parametrize("cli", ([], ["--mimo-lazy-encoder"]), ids=("eager-default", "lazy"))
-def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch, cli):
-    lazy_encoder = add_qwen35_native_args(ArgumentParser()).parse_args(cli).mimo_lazy_encoder
-    assert lazy_encoder is bool(cli)
-    source_kwargs = {"lazy_encoder": True} if lazy_encoder else {}
+@pytest.mark.parametrize(
+    "schedule", (None, "whole-step", "per-round"), ids=("default", "whole-step", "per-round")
+)
+def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch, schedule):
+    cli = [] if schedule is None else ["--mimo-dcp-encoder-schedule", schedule]
+    args = add_mimo_dcp_args(ArgumentParser()).parse_args(cli)
+    assert args.mimo_dcp_encoder_schedule == (schedule or "whole-step")
+    per_round = args.mimo_dcp_encoder_schedule == "per-round"
+    source_kwargs = {"per_round": per_round} if schedule is not None else {}
     media = []
     for image_id, grid_size in (
         (91, (2, 2)),
@@ -57,10 +61,10 @@ def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch, cli):
             source, producer_ranks=range(4), rank=rank, device="cpu", **source_kwargs
         )
         assert actual_samples is samples
-        assert callable(encoder_inputs) is lazy_encoder
-        assert len(materialized) == calls_before + (not lazy_encoder)
-        for requested in (ids, ids[::-1], ids[1:], []) if lazy_encoder else (ids,):
-            inputs = encoder_inputs(requested) if lazy_encoder else encoder_inputs
+        assert callable(encoder_inputs) is per_round
+        assert len(materialized) == calls_before + (not per_round)
+        for requested in (ids, ids[::-1], ids[1:], []) if per_round else (ids,):
+            inputs = encoder_inputs(requested) if per_round else encoder_inputs
             assert materialized[-1] == requested
             if not requested:
                 assert inputs == {}
@@ -73,7 +77,7 @@ def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch, cli):
             torch.testing.assert_close(
                 vision["grid_thw"], torch.cat([by_id[key]["grid"] for key in requested])
             )
-        if lazy_encoder:
+        if per_round:
             foreign_id = next(key for key in by_id if key not in ids)
             with pytest.raises(ValueError, match="belong to this encoder producer"):
                 encoder_inputs([foreign_id])
@@ -88,7 +92,7 @@ def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch, cli):
     _, _, encoder_inputs = qwen35_native.prepare_source(
         source, producer_ranks=range(8), rank=7, device="cpu", **source_kwargs
     )
-    assert (encoder_inputs([]) if lazy_encoder else encoder_inputs) == {}
+    assert (encoder_inputs([]) if per_round else encoder_inputs) == {}
     assert all(item["pixel_values"].device.type == "cpu" for item in media)
     assert samples["B"]["media_ids"] == [101, 9, 91]
 

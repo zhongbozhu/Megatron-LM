@@ -310,7 +310,7 @@ def model_provider(
                 producer_ranks=torch.distributed.get_process_group_ranks(pg.dp_cp),
                 rank=torch.distributed.get_rank(),
                 device=torch.device("cuda", torch.cuda.current_device()),
-                lazy_encoder=runtime_args.mimo_lazy_encoder,
+                per_round=runtime_args.mimo_dcp_encoder_schedule == "per-round",
             ),
             modality_name="images",
         )
