@@ -21,17 +21,14 @@ from PIL import Image
 from transformers import AutoConfig, AutoProcessor
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeModel
 
-from examples.mimo.data.source_batch import SourceBatchIterator
-from megatron.core.models.mimo.planning import MediaTask, assign_media_to_producers
-
 
 class Qwen35Dataset:
     """Build source global batches independently of the chosen decoder layout.
 
     ``step`` addresses the global sample stream directly, so resuming from a
     Megatron iteration yields the same samples without serializing an iterator.
-    Image identity determines the heldout split. Media IDs are batch-local and
-    distinct even when a source image is reused in a later optimizer step.
+    Document identity (or the first image hash) determines the heldout split.
+    Media IDs are batch-local and distinct when an image is reused in a later step.
     """
 
     def __init__(
@@ -72,7 +69,11 @@ class Qwen35Dataset:
         self.position_helper.get_vision_position_ids = MethodType(
             Qwen3_5MoeModel.get_vision_position_ids, self.position_helper
         )
-        identities = sorted({item["images"][0]["sha256"] for item in manifest["samples"]})
+
+        def split_identity(item):
+            return item.get("split_group", item["images"][0]["sha256"])
+
+        identities = sorted({split_identity(item) for item in manifest["samples"]})
         if not 0 < heldout_images < len(identities):
             raise ValueError("Training and heldout image sets must both be nonempty")
         split_seed = seed if split_seed is None else split_seed
@@ -83,14 +84,20 @@ class Qwen35Dataset:
         self.examples = []
         self.indices = {"train": [], "heldout": []}
         for metadata in manifest["samples"]:
-            if len(metadata["image_paths"]) != 1:
-                raise ValueError("The CLEVR adapter expects one image per source conversation")
+            if not metadata["image_paths"] or len(metadata["image_paths"]) != len(
+                metadata["images"]
+            ):
+                raise ValueError(
+                    "Each source conversation needs matching image paths and metadata"
+                )
             record = records[metadata["record_index"]]
-            identity = metadata["images"][0]["sha256"]
-            image_path = self.manifest_path.parent / metadata["image_paths"][0]
-            if not image_path.is_file():
-                raise FileNotFoundError(image_path)
+            identity = split_identity(metadata)
+            image_paths = [self.manifest_path.parent / path for path in metadata["image_paths"]]
+            for image_path in image_paths:
+                if not image_path.is_file():
+                    raise FileNotFoundError(image_path)
             messages = []
+            image_index = 0
             for message in record["messages"]:
                 content = message["content"]
                 if isinstance(content, str):
@@ -100,15 +107,29 @@ class Qwen35Dataset:
                     if isinstance(item, str):
                         normalized.append({"type": "text", "text": item})
                     elif item.get("type") == "image":
-                        normalized.append({"type": "image", "image": str(image_path)})
+                        if image_index >= len(image_paths):
+                            raise ValueError("More image markers than source image paths")
+                        original_path = metadata["images"][image_index].get("path")
+                        if (
+                            len(image_paths) > 1
+                            and original_path is not None
+                            and item.get("image") != original_path
+                        ):
+                            raise ValueError("Source image markers and manifest paths disagree")
+                        normalized.append(
+                            {"type": "image", "image": str(image_paths[image_index])}
+                        )
+                        image_index += 1
                     elif item.get("type") == "text":
                         normalized.append({"type": "text", "text": item["text"]})
                     else:
-                        raise ValueError(f"Unsupported CLEVR content: {item}")
+                        raise ValueError(f"Unsupported image conversation content: {item}")
                 messages.append({"role": message["role"], "content": normalized})
+            if image_index != len(image_paths):
+                raise ValueError("Source image paths must match image marker count")
             index = len(self.examples)
             self.examples.append(
-                {"messages": messages, "path": str(image_path), "source_id": record["id"]}
+                {"messages": messages, "paths": image_paths, "source_id": record["id"]}
             )
             self.indices["heldout" if identity in heldout else "train"].append(index)
         for split in self.indices:
@@ -116,8 +137,11 @@ class Qwen35Dataset:
             random.Random(order_seed).shuffle(self.indices[split])
         self._accepted_indices = {split: [] for split in self.indices}
         self._source_cursors = {split: 0 for split in self.indices}
+        # Processed multi-page documents can occupy GBs each on CPU. This bounds
+        # retained past documents; the current source batch still owns its inputs.
+        cache_size = 8 if any(len(item["paths"]) > 1 for item in self.examples) else 512
+        self._sample = lru_cache(maxsize=cache_size)(self._sample)
 
-    @lru_cache(maxsize=512)
     def _sample(self, index):
         example = self.examples[index]
         # Qwen's inference template drops reasoning from historical assistant
@@ -128,17 +152,22 @@ class Qwen35Dataset:
             message["role"] != ("user" if index % 2 == 0 else "assistant")
             for index, message in enumerate(messages)
         ):
-            raise ValueError("CLEVR conversations must contain complete user/assistant pairs")
+            raise ValueError("Image conversations must contain complete user/assistant pairs")
         rendered = "".join(
             self.processor.apply_chat_template(
                 messages[index : index + 2], tokenize=False, add_generation_prompt=False
             )
             for index in range(0, len(messages), 2)
         )
-        with Image.open(example["path"]) as image:
-            processed = self.processor(
-                text=[rendered], images=[image.convert("RGB")], return_tensors="pt"
-            )
+        images = []
+        try:
+            for path in example["paths"]:
+                with Image.open(path) as image:
+                    images.append(image.convert("RGB"))
+            processed = self.processor(text=[rendered], images=images, return_tensors="pt")
+        finally:
+            for image in images:
+                image.close()
         ids = processed["input_ids"][0]
         length = ids.numel() - 1
         if length > self.max_length:
@@ -174,18 +203,25 @@ class Qwen35Dataset:
         if not supervised[1:].any():
             raise ValueError("HF chat formatting produced no assistant supervision")
         sample = self._pad_sample(ids, supervised, positions[:, 0])
-        temporal, height, width = grid[0].tolist()
-        if temporal != 1 or len(grid) != 1:
-            raise ValueError("This CLEVR dataset contains still images only")
+        if len(grid) != len(example["paths"]) or (grid[:, 0] != 1).any():
+            raise ValueError("Each source image must produce one still-image grid")
         patch_size = self.config.vision_config.patch_size
-        media = {
-            "path": example["path"],
-            "size": (height * patch_size, width * patch_size),
-            "length": image_rows,
-            "grid": grid,
-            "pixel_values": processed["pixel_values"],
-            "source_id": example["source_id"],
-        }
+        patch_counts = grid.prod(-1).tolist()
+        pixels = processed["pixel_values"].split(patch_counts)
+        media = []
+        for index, (path, patches) in enumerate(zip(example["paths"], pixels)):
+            _, height, width = grid[index].tolist()
+            media.append(
+                {
+                    "path": str(path),
+                    "size": (height * patch_size, width * patch_size),
+                    "length": patch_counts[index]
+                    // self.config.vision_config.spatial_merge_size**2,
+                    "grid": grid[index : index + 1],
+                    "pixel_values": patches,
+                    "source_id": example["source_id"],
+                }
+            )
         return sample, media
 
     def _pad_sample(self, ids, supervised, positions):
@@ -210,24 +246,35 @@ class Qwen35Dataset:
         samples, media = {}, []
         accepted = self._accepted_indices[split]
         rejected = 0
+        begin = step * global_batch_size
+        prepared = {}
         # Address the accepted stream, not the raw stream: excluding an oversize
         # record must not cause adjacent optimizer steps to overlap accidentally.
         while len(accepted) < (step + 1) * global_batch_size:
             source_index = indices[self._source_cursors[split] % len(indices)]
             self._source_cursors[split] += 1
-            if self._sample(source_index) is None:
+            item = self._sample(source_index)
+            if item is None:
                 rejected += 1
                 if rejected >= len(indices):
                     raise ValueError("No complete source conversations fit the context limit")
                 continue
             accepted.append(source_index)
+            if len(accepted) > begin:
+                prepared[len(accepted) - 1] = item
             rejected = 0
-        begin = step * global_batch_size
-        for source_index in accepted[begin : begin + global_batch_size]:
-            sample, image = self._sample(source_index)
+        for position, source_index in enumerate(
+            accepted[begin : begin + global_batch_size], begin
+        ):
+            sample, images = (
+                prepared[position] if position in prepared else self._sample(source_index)
+            )
             sample_id = len(samples)
-            samples[sample_id] = {**sample, "media_ids": [sample_id]}
-            media.append({**image, "image_id": sample_id})
+            media_ids = list(range(len(media), len(media) + len(images)))
+            samples[sample_id] = {**sample, "media_ids": media_ids}
+            media.extend(
+                {**image, "image_id": media_id} for image, media_id in zip(images, media_ids)
+            )
         return samples, media
 
 
@@ -254,6 +301,8 @@ def prepare_source(source, *, producer_ranks, rank, device, per_round=False):
     requested local media IDs in order. Both modes use the same producer
     assignment, projected-row offsets and image preprocessing.
     """
+    from megatron.core.models.mimo.planning import MediaTask, assign_media_to_producers
+
     media = source["media"]
     tasks = []
     for item in media:
@@ -290,6 +339,7 @@ def prepare_disagg_source(source, *, args, topology):
 
 def train_valid_test_datasets_provider(*_args, **_kwargs):
     """Resume native train/heldout source streams using their own global batch sizes."""
+    from examples.mimo.data.source_batch import SourceBatchIterator
     from megatron.training import get_args
     from megatron.training.global_vars import get_run_config, get_train_state
 

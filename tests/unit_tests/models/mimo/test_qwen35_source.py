@@ -1,6 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Qwen data adapter boundaries: image row order and native source resume."""
 
+import json
+import os
 from argparse import ArgumentParser
 from types import SimpleNamespace
 
@@ -13,6 +15,95 @@ from examples.mimo.data import qwen35_native
 from examples.mimo.training.args import add_mimo_dcp_args
 from megatron import training
 from megatron.training import global_vars
+
+
+def test_qwen_native_multiimage_document(tmp_path, monkeypatch):
+    snapshot = os.environ.get("MIMO_HF_MODEL")
+    if not snapshot:
+        pytest.skip("Set MIMO_HF_MODEL to a local Qwen3.5 processor snapshot")
+    paths = []
+    for index, size in enumerate(((64, 96), (128, 64), (96, 96))):
+        path = tmp_path / f"page-{index}.png"
+        qwen35_native.Image.new("RGB", size, (index * 90, 30, 210 - index * 60)).save(path)
+        paths.append(path)
+    records, metadata = [], []
+    for index, pages in enumerate((paths[:2], paths[2:])):
+        records.append(
+            dict(
+                id=f"document-{index}",
+                messages=[
+                    dict(
+                        role="user",
+                        content=[
+                            *[dict(type="image", image=path.name) for path in pages],
+                            "Describe these pages.",
+                        ],
+                    ),
+                    dict(role="assistant", content=["These are colored pages."]),
+                ],
+            )
+        )
+        metadata.append(
+            dict(
+                record_index=index,
+                split_group=f"document-{index}",
+                image_paths=[path.name for path in pages],
+                images=[dict(path=path.name, sha256=path.stem) for path in pages],
+            )
+        )
+    (tmp_path / "records.jsonl").write_text("\n".join(json.dumps(r) for r in records))
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(dict(records_file="records.jsonl", samples=metadata)))
+    dataset = qwen35_native.Qwen35Dataset(manifest, snapshot, heldout_images=1)
+    assert dataset._sample.cache_info().maxsize == 8
+    for index, pages in enumerate((paths[:2], paths[2:])):
+        sample, media = dataset._sample(index)
+        assert len(media) == len(pages)
+        for item, path in zip(media, pages):
+            with qwen35_native.Image.open(path) as image:
+                standalone = dataset.processor.image_processor(images=[image], return_tensors="pt")
+            torch.testing.assert_close(
+                item["pixel_values"], standalone["pixel_values"], rtol=0, atol=0
+            )
+            torch.testing.assert_close(item["grid"], standalone["image_grid_thw"], rtol=0, atol=0)
+            assert item["path"] == str(path) and item["pixel_values"].device.type == "cpu"
+        assert int((sample["tokens"] == dataset.image_token_id).sum()) == sum(
+            m["length"] for m in media
+        )
+        logical = sample["original_seq_len"]
+        ids = torch.cat((sample["tokens"][:logical], sample["labels"][logical - 1 : logical]))[
+            None
+        ]
+        positions, _ = qwen35_native.Qwen3_5MoeModel.get_rope_index(
+            dataset.position_helper,
+            input_ids=ids,
+            mm_token_type_ids=(ids == dataset.image_token_id).int(),
+            image_grid_thw=torch.cat([m["grid"] for m in media]),
+        )
+        torch.testing.assert_close(sample["position_ids"][:, :logical], positions[:, 0, :-1])
+
+    # Each accepted sample is prepared once even when the source batch exceeds
+    # the cache. Keep this assertion independent of the processor's own caches.
+    uncached = dataset._sample.__wrapped__
+    prepared = []
+
+    def observe(index):
+        prepared.append(index)
+        return uncached(index)
+
+    monkeypatch.setattr(dataset, "_sample", observe)
+    dataset.indices["train"] = [0, 1]
+    samples, media = dataset.build_global_batch(0, 9)
+    assert prepared == [0, 1, 0, 1, 0, 1, 0, 1, 0]
+    assert [samples[i]["media_ids"] for i in range(3)] == [[0, 1], [2], [3, 4]]
+    assert [item["image_id"] for item in media] == list(range(len(media)))
+    assert [item["path"] for item in media[:5]] == [str(paths[i]) for i in (0, 1, 2, 0, 1)]
+    dataset.max_length = 1
+    assert uncached(0) is None  # Expanded vision tokens participate in admission.
+    records[0]["messages"][0]["content"][:2] = reversed(records[0]["messages"][0]["content"][:2])
+    (tmp_path / "records.jsonl").write_text("\n".join(json.dumps(r) for r in records))
+    with pytest.raises(ValueError, match="markers and manifest paths disagree"):
+        qwen35_native.Qwen35Dataset(manifest, snapshot, heldout_images=1)
 
 
 @pytest.mark.parametrize(
