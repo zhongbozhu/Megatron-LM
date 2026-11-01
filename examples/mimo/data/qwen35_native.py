@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoConfig, AutoProcessor
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeModel
 
 
@@ -137,8 +138,8 @@ class Qwen35Dataset:
             random.Random(order_seed).shuffle(self.indices[split])
         self._accepted_indices = {split: [] for split in self.indices}
         self._source_cursors = {split: 0 for split in self.indices}
-        # Processed multi-page documents can occupy GBs each on CPU. This bounds
-        # retained past documents; the current source batch still owns its inputs.
+        # Bound cached token and mRoPE tensors for multi-page documents. Pixels
+        # are processed only when the assigned encoder requests them.
         cache_size = 8 if any(len(item["paths"]) > 1 for item in self.examples) else 512
         self._sample = lru_cache(maxsize=cache_size)(self._sample)
 
@@ -159,20 +160,37 @@ class Qwen35Dataset:
             )
             for index in range(0, len(messages), 2)
         )
-        images = []
-        try:
-            for path in example["paths"]:
-                with Image.open(path) as image:
-                    images.append(image.convert("RGB"))
-            processed = self.processor(text=[rendered], images=images, return_tensors="pt")
-        finally:
-            for image in images:
-                image.close()
+        # Plan image geometry from headers without decoding or normalizing pixels
+        # on every decoder rank. HF still owns resizing and placeholder expansion.
+        image_processor = self.processor.image_processor
+        grids = []
+        for path in example["paths"]:
+            with Image.open(path) as image:
+                width, height = image.size
+            if image_processor.do_resize:
+                height, width = smart_resize(
+                    height,
+                    width,
+                    factor=image_processor.patch_size * image_processor.merge_size,
+                    min_pixels=image_processor.size["shortest_edge"],
+                    max_pixels=image_processor.size["longest_edge"],
+                )
+            grids.append(
+                [1, height // image_processor.patch_size, width // image_processor.patch_size]
+            )
+        grid = torch.tensor(grids, dtype=torch.long)
+        text, _ = self.processor.get_text_with_replacements(
+            [rendered],
+            images_replacements=[
+                self.processor.replace_image_token({"image_grid_thw": grid}, index)
+                for index in range(len(grid))
+            ],
+        )
+        processed = self.processor(text=text, return_tensors="pt")
         ids = processed["input_ids"][0]
         length = ids.numel() - 1
         if length > self.max_length:
             return None
-        grid = processed["image_grid_thw"]
         image_rows = int(grid.prod(-1).sum()) // self.config.vision_config.spatial_merge_size**2
         if int((ids == self.image_token_id).sum()) != image_rows:
             raise ValueError("Image placeholders do not match the processor's merged feature grid")
@@ -207,9 +225,8 @@ class Qwen35Dataset:
             raise ValueError("Each source image must produce one still-image grid")
         patch_size = self.config.vision_config.patch_size
         patch_counts = grid.prod(-1).tolist()
-        pixels = processed["pixel_values"].split(patch_counts)
         media = []
-        for index, (path, patches) in enumerate(zip(example["paths"], pixels)):
+        for index, path in enumerate(example["paths"]):
             _, height, width = grid[index].tolist()
             media.append(
                 {
@@ -218,7 +235,7 @@ class Qwen35Dataset:
                     "length": patch_counts[index]
                     // self.config.vision_config.spatial_merge_size**2,
                     "grid": grid[index : index + 1],
-                    "pixel_values": patches,
+                    "load_pixels": self._load_pixels,
                     "source_id": example["source_id"],
                 }
             )
@@ -236,6 +253,23 @@ class Qwen35Dataset:
             "original_seq_len": length,
             "padded_seq_len": padded,
         }
+
+    def _load_pixels(self, media):
+        """Preprocess exactly the producer's requested images in feature-row order."""
+        images = []
+        try:
+            for item in media:
+                with Image.open(item["path"]) as image:
+                    images.append(image.convert("RGB"))
+            processed = self.processor.image_processor(images=images, return_tensors="pt")
+        finally:
+            for image in images:
+                image.close()
+        if not torch.equal(
+            processed["image_grid_thw"], torch.cat([item["grid"] for item in media])
+        ):
+            raise ValueError("Image preprocessing grid differs from the planned feature grid")
+        return processed["pixel_values"]
 
     def build_global_batch(self, step, global_batch_size, split=None):
         """Return ``(samples, media)`` using global-batch-local contiguous IDs."""
@@ -282,12 +316,15 @@ def build_vision_inputs(media, device):
     """Build the native Qwen vision encoder's THD patch stream."""
     if not media:
         return {}
+    pixels = (
+        torch.cat([item["pixel_values"] for item in media])
+        if "pixel_values" in media[0]
+        else media[0]["load_pixels"](media)
+    )
     return {
         "images": {
             "qwen35": {
-                "hidden_states": torch.cat([item["pixel_values"] for item in media]).to(
-                    device=device, dtype=torch.bfloat16
-                ),
+                "hidden_states": pixels.to(device=device, dtype=torch.bfloat16),
                 "grid_thw": torch.cat([item["grid"] for item in media]).to(device=device),
             }
         }
@@ -297,7 +334,7 @@ def build_vision_inputs(media, device):
 def prepare_source(source, *, producer_ranks, rank, device, per_round=False):
     """Assign images for whole-step encoding, or materialize them lazily on demand.
 
-    Lazy mode retains source patches on CPU and returns a callable that packs
+    Lazy mode retains image metadata and returns a callable that preprocesses
     requested local media IDs in order. Both modes use the same producer
     assignment, projected-row offsets and image preprocessing.
     """

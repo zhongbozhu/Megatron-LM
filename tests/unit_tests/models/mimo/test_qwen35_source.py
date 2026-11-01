@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import ImageFile
 
 pytest.importorskip("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
 
@@ -22,9 +23,11 @@ def test_qwen_native_multiimage_document(tmp_path, monkeypatch):
     if not snapshot:
         pytest.skip("Set MIMO_HF_MODEL to a local Qwen3.5 processor snapshot")
     paths = []
-    for index, size in enumerate(((64, 96), (128, 64), (96, 96))):
+    for index, size in enumerate(((65, 97), (129, 65), (257, 193))):
         path = tmp_path / f"page-{index}.png"
-        qwen35_native.Image.new("RGB", size, (index * 90, 30, 210 - index * 60)).save(path)
+        width, height = size
+        pixels = (torch.arange(height * width * 3) + index * 37).remainder(256)
+        qwen35_native.Image.fromarray(pixels.reshape(height, width, 3).byte().numpy()).save(path)
         paths.append(path)
     records, metadata = [], []
     for index, pages in enumerate((paths[:2], paths[2:])):
@@ -55,32 +58,64 @@ def test_qwen_native_multiimage_document(tmp_path, monkeypatch):
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps(dict(records_file="records.jsonl", samples=metadata)))
     dataset = qwen35_native.Qwen35Dataset(manifest, snapshot, heldout_images=1)
-    assert dataset._sample.cache_info().maxsize == 8
+
+    def forbid_pixels(patch):
+        def fail(*args, **kwargs):
+            raise AssertionError("Metadata planning or a decoder rank processed image pixels")
+
+        patch.setattr(qwen35_native.Image.Image, "convert", fail)
+        patch.setattr(ImageFile.ImageFile, "load", fail)
+        patch.setattr(dataset.processor.image_processor, "preprocess", fail)
+
+    reference_pixels = {}
     for index, pages in enumerate((paths[:2], paths[2:])):
-        sample, media = dataset._sample(index)
+        with monkeypatch.context() as patch:
+            forbid_pixels(patch)
+            sample, media = dataset._sample(index)
         assert len(media) == len(pages)
-        for item, path in zip(media, pages):
+        assert all("pixel_values" not in item and callable(item["load_pixels"]) for item in media)
+        messages = dataset.examples[index]["messages"]
+        rendered = dataset.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        images = []
+        for path in pages:
             with qwen35_native.Image.open(path) as image:
-                standalone = dataset.processor.image_processor(images=[image], return_tensors="pt")
-            torch.testing.assert_close(
-                item["pixel_values"], standalone["pixel_values"], rtol=0, atol=0
-            )
-            torch.testing.assert_close(item["grid"], standalone["image_grid_thw"], rtol=0, atol=0)
-            assert item["path"] == str(path) and item["pixel_values"].device.type == "cpu"
+                images.append(image.convert("RGB"))
+        try:
+            reference = dataset.processor(text=[rendered], images=images, return_tensors="pt")
+        finally:
+            for image in images:
+                image.close()
+        logical = sample["original_seq_len"]
+        ids = reference["input_ids"]
+        assert logical == ids.shape[1] - 1
+        torch.testing.assert_close(sample["tokens"][:logical], ids[0, :-1], rtol=0, atol=0)
+        torch.testing.assert_close(sample["labels"][:logical], ids[0, 1:], rtol=0, atol=0)
+        for item, path, grid, pixels in zip(
+            media,
+            pages,
+            reference["image_grid_thw"],
+            reference["pixel_values"].split(reference["image_grid_thw"].prod(-1).tolist()),
+        ):
+            assert item["path"] == str(path)
+            torch.testing.assert_close(item["grid"][0], grid, rtol=0, atol=0)
+            reference_pixels[str(path)] = pixels
+        torch.testing.assert_close(
+            media[0]["load_pixels"](media), reference["pixel_values"], rtol=0, atol=0
+        )
         assert int((sample["tokens"] == dataset.image_token_id).sum()) == sum(
             m["length"] for m in media
         )
-        logical = sample["original_seq_len"]
-        ids = torch.cat((sample["tokens"][:logical], sample["labels"][logical - 1 : logical]))[
-            None
-        ]
         positions, _ = qwen35_native.Qwen3_5MoeModel.get_rope_index(
             dataset.position_helper,
             input_ids=ids,
             mm_token_type_ids=(ids == dataset.image_token_id).int(),
-            image_grid_thw=torch.cat([m["grid"] for m in media]),
+            image_grid_thw=reference["image_grid_thw"],
         )
-        torch.testing.assert_close(sample["position_ids"][:, :logical], positions[:, 0, :-1])
+        torch.testing.assert_close(
+            sample["position_ids"][:, :logical], positions[:, 0, :-1], rtol=0, atol=0
+        )
 
     # Each accepted sample is prepared once even when the source batch exceeds
     # the cache. Keep this assertion independent of the processor's own caches.
@@ -93,13 +128,66 @@ def test_qwen_native_multiimage_document(tmp_path, monkeypatch):
 
     monkeypatch.setattr(dataset, "_sample", observe)
     dataset.indices["train"] = [0, 1]
-    samples, media = dataset.build_global_batch(0, 9)
+    with monkeypatch.context() as patch:
+        forbid_pixels(patch)
+        samples, media = dataset.build_global_batch(0, 9)
     assert prepared == [0, 1, 0, 1, 0, 1, 0, 1, 0]
     assert [samples[i]["media_ids"] for i in range(3)] == [[0, 1], [2], [3, 4]]
     assert [item["image_id"] for item in media] == list(range(len(media)))
     assert [item["path"] for item in media[:5]] == [str(paths[i]) for i in (0, 1, 2, 0, 1)]
+    # The same metadata-only source serves both encoder schedules. Opening and
+    # normalizing pixels is confined to the producer's requested image chunk.
+    source = dict(samples=samples, media=media)
+    by_id = {item["image_id"]: item for item in media}
+    original_open = qwen35_native.Image.open
+    for per_round in (False, True):
+        with monkeypatch.context() as patch:
+            forbid_pixels(patch)
+            _, _, inputs = qwen35_native.prepare_source(
+                source, producer_ranks=range(2), rank=2, device="cpu", per_round=per_round
+            )
+            assert (inputs([]) if per_round else inputs) == {}
+        for rank in range(2):
+            opened = []
+
+            def observe_open(path, *args, **kwargs):
+                opened.append(str(path))
+                return original_open(path, *args, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(qwen35_native.Image, "open", observe_open)
+                _, slices, inputs = qwen35_native.prepare_source(
+                    source, producer_ranks=range(2), rank=rank, device="cpu", per_round=per_round
+                )
+                owned = sorted(
+                    (key for key, value in slices.items() if value.producer_rank == rank),
+                    key=lambda key: slices[key].offset,
+                )
+                if per_round:
+                    assert opened == []
+                    # Deliberately change chunk order; no foreign page may be decoded.
+                    requested = owned[::-1][:2]
+                    vision = inputs(requested)["images"]["qwen35"]
+                else:
+                    requested = owned
+                    vision = inputs["images"]["qwen35"]
+            assert opened == [by_id[key]["path"] for key in requested]
+            torch.testing.assert_close(
+                vision["hidden_states"],
+                torch.cat([reference_pixels[by_id[key]["path"]] for key in requested]).bfloat16(),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                vision["grid_thw"],
+                torch.cat([by_id[key]["grid"] for key in requested]),
+                rtol=0,
+                atol=0,
+            )
     dataset.max_length = 1
-    assert uncached(0) is None  # Expanded vision tokens participate in admission.
+    with monkeypatch.context() as patch:
+        forbid_pixels(patch)
+        assert uncached(0) is None  # Expanded vision tokens participate in admission.
     records[0]["messages"][0]["content"][:2] = reversed(records[0]["messages"][0]["content"][:2])
     (tmp_path / "records.jsonl").write_text("\n".join(json.dumps(r) for r in records))
     with pytest.raises(ValueError, match="markers and manifest paths disagree"):
