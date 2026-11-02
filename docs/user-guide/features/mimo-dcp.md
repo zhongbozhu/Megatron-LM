@@ -254,15 +254,14 @@ resumes from consumed source samples, independently of the number of packed
 decoder rounds. `--mimo-vision-recompute` enables full recomputation of the
 27-layer vision tower; decoder recomputation remains independently configured.
 
-Whole-step encoder execution is the default. Use
+The generic CLI defaults to whole-step encoder execution. The Qwen launcher
+selects per-round execution for long documents. Use
 `--mimo-dcp-encoder-schedule per-round` to encode
 images on their first consuming decoder round and release their graphs after
 the last consumer. This trades encoder batching efficiency for shorter graph
 lifetimes; it does not overlap encoder and decoder computation on colocated GPUs.
-In a 16-GPU Qwen3.5 validation with full vision recompute and about four images
-per producer, per-round execution reduced the peak PyTorch allocation by about
-0.09 GiB but increased steady-state step time by 2.3%. Measure the tradeoff for
-your workload before enabling it. The example launcher forwards this option:
+Measure the tradeoff for your workload. The launcher also accepts
+`ENCODER_SCHEDULE=whole-step` and forwards CLI overrides:
 
 ```bash
 bash examples/mimo/scripts/run_qwen35_colocated_dcp.sh --mimo-dcp-encoder-schedule per-round
@@ -272,9 +271,9 @@ This provider requires TP=PP=1, encoder TP=CP=1, non-overlapped DDP, per-token
 loss, `--dataloader-type external`, and a sequence-packing scheduler. Encoder DP
 spans the decoder DP x CP domain. The GPT/GDN decoder uses the same zigzag layout
 for linear attention and standard attention; differing CP layouts require a
-separate model adapter. The CLEVR dataset currently provides one image per
-conversation and preprocesses source samples on every rank before assigning
-encoder work. The generic planner and transport also support multi-image packs.
+separate model adapter. Source records can contain multiple images, including
+document pages. All ranks prepare text and image metadata; image pixels are
+preprocessed only by their assigned encoder producers.
 
 The E2E overlay includes `examples/mimo/scripts/run_qwen35_colocated_dcp.sh`.
 Run it once per node in an environment with the required Transformer Engine,
@@ -295,14 +294,31 @@ NODE_RANK=0 MIMO_LOAD="$MIMO_OUTPUT_DIR" \
 ```
 
 Defaults are 16 colocated GPUs, encoder DP16, decoder TP1/PP1/CP8/DP2/EP16,
-BF16, native MoE auxiliary loss, MTP1, full decoder and vision recompute, GBS64,
-and 50 total steps. `SEQ_LENGTH=40960` is the source admission limit;
-131072 is only the positional capacity. The DCP per-rank cap is 8192 and does
+BF16, native MoE auxiliary loss, MTP1, GBS64, and 50 total steps. The GB200
+long-document recipe uses cuDNN GDN (`GDN_KERNEL_BACKEND=transformer_engine`),
+selective decoder recompute of `gdn_norm_out` only, full vision recompute,
+per-round encoding, and `EMPTY_UNUSED_MEMORY_LEVEL=0`. GDN preprocessing fusion
+is disabled. `SEQ_LENGTH=131072` is both the source admission limit and positional
+capacity. The DCP per-rank cap is 8192 and does
 not imply that every rank is padded to that length. Set `MIMO_LAYOUT=static_cp`
 for the paired static CP8 run, using a separate output directory. `MIMO_LAYOUT=cp1`
 uses the source length as its default per-rank cap. For common-layout heldout
 evaluation, set `MIMO_LOAD`, `MIMO_LAYOUT=cp1`, and `EVAL_ITERS=4`, then append
 `--skip-train --no-load-optim`. No GTP/EGTP weight sharding is enabled.
+
+Use `DECODER_RECOMPUTE=full|selective|none`, `VISION_RECOMPUTE=0|1`, and
+`GDN_KERNEL_BACKEND=fla|transformer_engine` to select other memory/backend tradeoffs.
+The default was validated on 16 GB200 GPUs with PyTorch
+`2.13.0a0+8145d630e8.nv26.6.54250401`, Transformer Engine `2.21.0.dev0+eb56ba22`,
+cuDNN `9.25.1.1`, and cuDNN Frontend `1.33.0`. Frontend 1.33 includes the
+caller-owned GDN workspace fix; older workspace caching can retain substantial
+GPU memory. The launcher does not install dependencies.
+
+The validation environment used `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`,
+`TORCHINDUCTOR_COMPILE_THREADS=1`, `TORCH_NCCL_HIGH_PRIORITY=0`, and left
+`CUDA_DEVICE_MAX_CONNECTIONS` unset on GB200. Set these in the job environment;
+they are not portable fabric defaults. Throughput counts decoder FLOPs only,
+including MTP, divided by 16 decoder GPUs and complete training-step time.
 
 For disaggregated placement, use `examples/mimo/scripts/run_qwen35_disagg_dcp.sh`.
 It reuses the same model, data, optimizer and checkpoint arguments while selecting
