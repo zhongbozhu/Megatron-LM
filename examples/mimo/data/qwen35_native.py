@@ -11,6 +11,7 @@ and reasoning are retained. Oversize conversations are excluded, never truncated
 import hashlib
 import json
 import random
+from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -42,7 +43,10 @@ class Qwen35Dataset:
         heldout_images=64,
         alignment=32,
         split_seed=None,
+        cache_size=512,
     ):
+        if cache_size < 0:
+            raise ValueError("Source cache size must be nonnegative")
         self.manifest_path = Path(manifest_path).resolve()
         max_length = seq_length
         self.max_length = max_length
@@ -57,6 +61,8 @@ class Qwen35Dataset:
         records_path = self.manifest_path.parent / manifest["records_file"]
         records = [json.loads(line) for line in records_path.read_text().splitlines()]
         self.processor = AutoProcessor.from_pretrained(hf_model_path, local_files_only=True)
+        # Source metadata may be prepared concurrently with producer pixel loading.
+        self._pixel_processor = deepcopy(self.processor.image_processor)
         self.config = AutoConfig.from_pretrained(hf_model_path, local_files_only=True)
         self.image_token_id = self.config.image_token_id
         self.pad_token_id = self.processor.tokenizer.pad_token_id
@@ -88,9 +94,7 @@ class Qwen35Dataset:
             if not metadata["image_paths"] or len(metadata["image_paths"]) != len(
                 metadata["images"]
             ):
-                raise ValueError(
-                    "Each source conversation needs matching image paths and metadata"
-                )
+                raise ValueError("Each source conversation needs matching image paths and metadata")
             record = records[metadata["record_index"]]
             identity = split_identity(metadata)
             image_paths = [self.manifest_path.parent / path for path in metadata["image_paths"]]
@@ -117,9 +121,7 @@ class Qwen35Dataset:
                             and item.get("image") != original_path
                         ):
                             raise ValueError("Source image markers and manifest paths disagree")
-                        normalized.append(
-                            {"type": "image", "image": str(image_paths[image_index])}
-                        )
+                        normalized.append({"type": "image", "image": str(image_paths[image_index])})
                         image_index += 1
                     elif item.get("type") == "text":
                         normalized.append({"type": "text", "text": item["text"]})
@@ -140,7 +142,6 @@ class Qwen35Dataset:
         self._source_cursors = {split: 0 for split in self.indices}
         # Bound cached token and mRoPE tensors for multi-page documents. Pixels
         # are processed only when the assigned encoder requests them.
-        cache_size = 8 if any(len(item["paths"]) > 1 for item in self.examples) else 512
         self._sample = lru_cache(maxsize=cache_size)(self._sample)
 
     def _sample(self, index):
@@ -186,8 +187,10 @@ class Qwen35Dataset:
                 for index in range(len(grid))
             ],
         )
-        processed = self.processor(text=text, return_tensors="pt")
-        ids = processed["input_ids"][0]
+        # Keep HF's special-token checks on integer lists: checking scalar tensors
+        # creates expensive Python comparisons for long image-placeholder spans.
+        processed = self.processor(text=text, return_tensors=None)
+        ids = torch.tensor(processed["input_ids"][0], dtype=torch.long)
         length = ids.numel() - 1
         if length > self.max_length:
             return None
@@ -261,7 +264,7 @@ class Qwen35Dataset:
             for item in media:
                 with Image.open(item["path"]) as image:
                     images.append(image.convert("RGB"))
-            processed = self.processor.image_processor(images=images, return_tensors="pt")
+            processed = self._pixel_processor(images=images, return_tensors="pt")
         finally:
             for image in images:
                 image.close()
@@ -297,9 +300,7 @@ class Qwen35Dataset:
             if len(accepted) > begin:
                 prepared[len(accepted) - 1] = item
             rejected = 0
-        for position, source_index in enumerate(
-            accepted[begin : begin + global_batch_size], begin
-        ):
+        for position, source_index in enumerate(accepted[begin : begin + global_batch_size], begin):
             sample, images = (
                 prepared[position] if position in prepared else self._sample(source_index)
             )
@@ -381,8 +382,14 @@ def train_valid_test_datasets_provider(*_args, **_kwargs):
             split=split,
             heldout_images=args.mimo_heldout_images,
             split_seed=args.mimo_data_split_seed,
+            cache_size=getattr(args, "mimo_source_cache_size", 512),
         )
-        return SourceBatchIterator(dataset, global_batch_size, consumed)
+        return SourceBatchIterator(
+            dataset,
+            global_batch_size,
+            consumed,
+            prefetch=getattr(args, "mimo_source_prefetch", False),
+        )
 
     return (
         iterator("train", config.train.global_batch_size, state.consumed_train_samples),
