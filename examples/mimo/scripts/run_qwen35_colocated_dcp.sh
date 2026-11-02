@@ -29,10 +29,12 @@ esac
 
 entrypoint=examples/mimo/train.py
 placement_args=(--dataset-provider qwen35_native)
+vision_recompute_num_layers=${VISION_RECOMPUTE_NUM_LAYERS-}
 case "${MIMO_PLACEMENT:-colocated}" in
     colocated) ;;
     disagg)
         entrypoint=examples/mimo/pretrain_mimo.py
+        vision_recompute_num_layers=${VISION_RECOMPUTE_NUM_LAYERS-16}
         encoder_dp=${ENCODER_DP:-4}
         decoder_ranks=$(( ${NNODES:-4} * ${GPUS_PER_NODE:-4} - encoder_dp ))
         if (( encoder_dp <= 0 || decoder_ranks <= 0 || cp_size <= 0 || decoder_ranks % cp_size )); then
@@ -55,7 +57,12 @@ case "${DECODER_RECOMPUTE:-selective}" in
     *) echo "DECODER_RECOMPUTE must be selective, full, or none" >&2; exit 2 ;;
 esac
 case "${VISION_RECOMPUTE:-1}" in
-    1) recompute_args+=(--mimo-vision-recompute) ;;
+    1)
+        recompute_args+=(--mimo-vision-recompute)
+        if [[ -n ${vision_recompute_num_layers} ]]; then
+            recompute_args+=(--mimo-vision-recompute-num-layers "${vision_recompute_num_layers}")
+        fi
+        ;;
     0) ;;
     *) echo "VISION_RECOMPUTE must be 0 or 1" >&2; exit 2 ;;
 esac

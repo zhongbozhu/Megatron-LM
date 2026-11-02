@@ -334,6 +334,17 @@ Set `NNODES=5` explicitly if reusing an environment from the colocated launch.
 `ENCODER_DP` controls the leading encoder pool; decoder DP is derived from the
 remaining ranks and the selected CP size. DCP groups contain only decoder ranks.
 
+The disaggregated long-document recipe keeps cuDNN GDN, EP16 and selective
+decoder recompute of `gdn_norm_out`. Its vision default is
+`VISION_RECOMPUTE_NUM_LAYERS=16`: native full/block recompute checkpoints the
+first 16 of the 27 ViT layers and retains activations for the remaining layers.
+Set this to `27` to recompute every layer, or set `VISION_RECOMPUTE=0` to disable
+vision recompute entirely. The latter did not fit the tested E4 long-document
+workload: each producer processes more images than colocated DP16 and prefetch
+can retain both current and next-round graphs. The colocated default remains
+full vision recompute. These settings do not change parameter or checkpoint
+names; validate memory again when changing image resolution or producer count.
+
 Use the same path variables shown above and a separate output directory:
 
 ```bash
