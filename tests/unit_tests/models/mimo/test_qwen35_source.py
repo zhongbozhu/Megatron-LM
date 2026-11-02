@@ -4,6 +4,8 @@
 import json
 import os
 from argparse import ArgumentParser
+from functools import lru_cache
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +15,7 @@ from PIL import ImageFile
 pytest.importorskip("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
 
 from examples.mimo.data import qwen35_native
+from examples.mimo.data.source_batch import SourceBatchIterator
 from examples.mimo.training.args import add_mimo_dcp_args
 from megatron import training
 from megatron.training import global_vars
@@ -280,6 +283,102 @@ def test_qwen_image_assignment_preserves_thd_row_order(monkeypatch, schedule):
     assert decoder_slices == slices
     assert (decoder_inputs([]) if per_round else decoder_inputs) == {}
     assert samples["B"]["media_ids"] == [101, 9, 91]
+
+
+@pytest.mark.parametrize("cache_size", [0, 8])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_qwen_source_cache_prefetch_and_resume(cache_size, prefetch):
+    class Dataset(qwen35_native.Qwen35Dataset):
+        def __init__(self, cache_size, *, block=False, fail=False):
+            self.split = "train"
+            self.indices = {"train": [0, 1, 2]}
+            self._accepted_indices, self._source_cursors = {"train": []}, {"train": 0}
+            self.calls, self.block, self.fail = [], block, fail
+            self.started, self.release = Event(), Event()
+            self._sample = lru_cache(maxsize=cache_size)(self._sample)
+
+        def _sample(self, index):
+            if index == 1:  # A complete conversation exceeding the context limit.
+                return None
+            tokens = torch.arange(8) + index * 10
+            sample = dict(
+                tokens=tokens,
+                labels=tokens + 1,
+                loss_mask=torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0]),
+                position_ids=torch.arange(24).reshape(3, 8) + index,
+                original_seq_len=6,
+                padded_seq_len=8,
+            )
+            media = [
+                dict(
+                    path=f"{index}/{page}.png",
+                    size=(32, 32),
+                    length=4,
+                    grid=torch.tensor([[1, 4, 4]]),
+                    source_id=str(index),
+                )
+                for page in range(index + 2)
+            ]
+            return sample, media
+
+        def build_global_batch(self, step, size):
+            self.calls.append(step)
+            if step == 1 and self.block:
+                self.started.set()
+                if not self.release.wait(10):
+                    raise TimeoutError("Test did not release source producer")
+            if step == 1 and self.fail:
+                raise ValueError("source failure")
+            return super().build_global_batch(step, size)
+
+    def values(item):
+        if isinstance(item, torch.Tensor):
+            assert item.device.type == "cpu"
+            return item.tolist()
+        if isinstance(item, dict):
+            return {key: values(value) for key, value in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [values(value) for value in item]
+        return item
+
+    dataset = Dataset(cache_size, block=prefetch)
+    source = SourceBatchIterator(dataset, 3, prefetch=prefetch)
+    baseline = SourceBatchIterator(Dataset(0), 3)
+    resumed = None
+    try:
+        assert dataset.calls == []  # No work until the first consumer request.
+        assert values(next(source)) == values(next(baseline))
+        assert source.step == 1
+        if prefetch:
+            assert dataset.started.wait(10)
+            assert dataset.calls == [0, 1]  # Only the single next batch is in flight.
+            dataset.release.set()
+            source._future.result(timeout=10)
+            assert dataset.calls == [0, 1] and source.step == 1
+        source.close()  # Discard an already prepared but unconsumed batch.
+        source.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            next(source)
+        resumed = SourceBatchIterator(Dataset(cache_size), 3, consumed_samples=3, prefetch=prefetch)
+        for _ in range(4):  # Multiple wraps of the filtered, two-record stream.
+            assert values(next(resumed)) == values(next(baseline))
+        assert resumed.step == baseline.step == 5
+        assert bool(resumed.dataset._sample.cache_info().hits) == bool(cache_size)
+    finally:
+        dataset.release.set()
+        source.close()
+        baseline.close()
+        if resumed is not None:
+            resumed.close()
+
+    broken = SourceBatchIterator(Dataset(cache_size, fail=True), 3, prefetch=prefetch)
+    next(broken)
+    with pytest.raises(ValueError, match="source failure"):
+        next(broken)
+    assert broken.step == 1
+    broken.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        next(broken)
 
 
 def test_qwen_provider_uses_native_train_and_eval_resume(monkeypatch):

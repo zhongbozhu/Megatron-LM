@@ -46,6 +46,18 @@ def add_qwen35_native_args(parser):
         type=int,
         help="With --mimo-vision-recompute, recompute only this many of the 27 ViT layers",
     )
+    group.add_argument(
+        "--mimo-source-cache-size",
+        type=int,
+        default=512,
+        help="Maximum cached CPU source samples (tokens, positions and masks; no pixels); "
+        "0 disables the cache",
+    )
+    group.add_argument(
+        "--mimo-source-prefetch",
+        action="store_true",
+        help="Prepare one next source global batch on a CPU thread during training",
+    )
     return parser
 
 

@@ -67,6 +67,14 @@ case "${VISION_RECOMPUTE:-1}" in
     *) echo "VISION_RECOMPUTE must be 0 or 1" >&2; exit 2 ;;
 esac
 
+# CPU metadata only; set SOURCE_PREFETCH=0 for synchronous source preparation.
+source_args=(--mimo-source-cache-size "${SOURCE_CACHE_SIZE:-512}")
+case "${SOURCE_PREFETCH:-1}" in
+    1) source_args+=(--mimo-source-prefetch) ;;
+    0) ;;
+    *) echo "SOURCE_PREFETCH must be 0 or 1" >&2; exit 2 ;;
+esac
+
 checkpoint_args=(--save "${MIMO_OUTPUT_DIR}" --save-interval "${SAVE_INTERVAL:-25}")
 if [[ -n ${MIMO_LOAD:-} ]]; then
     checkpoint_args+=(--load "${MIMO_LOAD}" --exit-on-missing-checkpoint
@@ -86,7 +94,7 @@ exec "${PYTHON:-python}" -u -m torch.distributed.run \
     --nnodes "${NNODES:-4}" --nproc-per-node "${GPUS_PER_NODE:-4}" \
     --node-rank "${NODE_RANK:-0}" --master-addr "${MASTER_ADDR:-localhost}" \
     --master-port "${MASTER_PORT:-29500}" --max-restarts 0 \
-    "${entrypoint}" --model-provider qwen35_native "${placement_args[@]}" \
+    "${entrypoint}" --model-provider qwen35_native "${placement_args[@]}" "${source_args[@]}" \
     --mimo-manifest "${MIMO_MANIFEST}" --mimo-hf-model "${MIMO_HF_MODEL}" \
     --mimo-heldout-images "${HELDOUT_IMAGES:-512}" \
     --mimo-data-split-seed "${SPLIT_SEED:-20261002}" \
