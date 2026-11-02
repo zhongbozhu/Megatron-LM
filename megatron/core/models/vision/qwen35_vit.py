@@ -27,8 +27,14 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def qwen35_vision_config(language_config, *, recompute=True):
+def qwen35_vision_config(language_config, *, recompute=True, recompute_num_layers=None):
     """The pretrained 35B-A3B VL tower; decoder parallel/recompute knobs are independent."""
+    if recompute_num_layers is not None and (
+        not recompute
+        or type(recompute_num_layers) is not int
+        or not 1 <= recompute_num_layers <= 27
+    ):
+        raise ValueError("Partial vision recompute requires recompute=True and 1 to 27 layers")
     config = TransformerConfig(
         num_layers=27,
         hidden_size=1152,
@@ -55,8 +61,10 @@ def qwen35_vision_config(language_config, *, recompute=True):
         gradient_accumulation_fusion=language_config.gradient_accumulation_fusion,
         use_cpu_initialization=language_config.use_cpu_initialization,
         recompute_granularity="full" if recompute else None,
-        recompute_method="uniform" if recompute else None,
-        recompute_num_layers=1 if recompute else None,
+        recompute_method=("block" if recompute_num_layers is not None else "uniform")
+        if recompute
+        else None,
+        recompute_num_layers=(recompute_num_layers or 1) if recompute else None,
     )
     # The released Qwen vision tower rotates Q/K in FP32 before casting back.
     config.apply_rotary_pos_emb_in_fp32 = True

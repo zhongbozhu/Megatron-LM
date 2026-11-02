@@ -39,7 +39,12 @@ def add_qwen35_native_args(parser):
     group.add_argument(
         "--mimo-vision-recompute",
         action="store_true",
-        help="Full uniform layer recompute for the independent Qwen vision encoder",
+        help="Recompute all Qwen vision layers, or only the specified number of leading layers",
+    )
+    group.add_argument(
+        "--mimo-vision-recompute-num-layers",
+        type=int,
+        help="With --mimo-vision-recompute, recompute only this many of the 27 ViT layers",
     )
     return parser
 
@@ -143,7 +148,11 @@ def _vision_spec(args, config, encoder_pg):
     encoder = ModuleSpec(
         module=Qwen35VisionModel,
         params=dict(
-            transformer_config=qwen35_vision_config(config, recompute=args.mimo_vision_recompute),
+            transformer_config=qwen35_vision_config(
+                config,
+                recompute=args.mimo_vision_recompute,
+                recompute_num_layers=args.mimo_vision_recompute_num_layers,
+            ),
             output_size=config.hidden_size,
             pg_collection=encoder_pg,
         ),

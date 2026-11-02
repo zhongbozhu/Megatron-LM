@@ -31,8 +31,8 @@ def test_qwen35_mrope_local_positions_and_bf16_buffer():
     torch.testing.assert_close(full[:, 0, 0, :32], expected, rtol=2e-7, atol=0)
 
 
-@pytest.mark.parametrize("recompute", [False, True])
-def test_qwen35_vision_packing_and_recompute(recompute):
+@pytest.mark.parametrize("recompute,recompute_num_layers", [(False, None), (True, None), (True, 1)])
+def test_qwen35_vision_packing_and_recompute(recompute, recompute_num_layers):
     """Packed independent images must agree with separately encoded images and gradients."""
     Utils.initialize_model_parallel(1, 1)
     clear_nvte_env_vars()
@@ -47,14 +47,27 @@ def test_qwen35_vision_packing_and_recompute(recompute):
             gradient_accumulation_fusion=False,
             attention_backend=AttnBackend.fused,
         )
-        config = qwen35_vision_config(language, recompute=recompute)
+        config = qwen35_vision_config(
+            language, recompute=recompute, recompute_num_layers=recompute_num_layers
+        )
         config.num_layers = 2
         config.hidden_size = 144
         config.num_attention_heads = config.num_query_groups = 2
         config.ffn_hidden_size = 256
         pg = ProcessGroupCollection.use_mpu_process_groups()
         packed_model = Qwen35VisionModel(config, 128, pg).cuda()
-        separate_model = Qwen35VisionModel(deepcopy(config), 128, pg).cuda()
+        layer_calls = [0, 0]
+
+        def count_forward(module, inputs, output):
+            layer_calls[module.layer_number - 1] += 1
+
+        for layer in packed_model.decoder.layers:
+            layer.register_forward_hook(count_forward)
+        reference_config = deepcopy(config)
+        reference_config.recompute_granularity = None
+        reference_config.recompute_method = None
+        reference_config.recompute_num_layers = None
+        separate_model = Qwen35VisionModel(reference_config, 128, pg).cuda()
         separate_model.load_state_dict(packed_model.state_dict())
         patches = torch.randn(40, 1536, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         reference_patches = patches.detach().clone().requires_grad_(True)
@@ -69,6 +82,7 @@ def test_qwen35_vision_packing_and_recompute(recompute):
         torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.005)
         actual.float().square().sum().backward()
         expected.float().square().sum().backward()
+        assert layer_calls == ([2, 1] if recompute_num_layers else [1 + int(recompute)] * 2)
         torch.testing.assert_close(patches.grad, reference_patches.grad, rtol=0.03, atol=0.005)
         for (_, parameter), (_, reference) in zip(
             packed_model.named_parameters(), separate_model.named_parameters()
