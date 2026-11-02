@@ -300,14 +300,20 @@ selective decoder recompute of `gdn_norm_out` only, full vision recompute,
 per-round encoding, and `EMPTY_UNUSED_MEMORY_LEVEL=0`. GDN preprocessing fusion
 is disabled. `SEQ_LENGTH=131072` is both the source admission limit and positional
 capacity. The DCP per-rank cap is 8192 and does
-not imply that every rank is padded to that length. Set `MIMO_LAYOUT=static_cp`
-for the paired static CP8 run, using a separate output directory. `MIMO_LAYOUT=cp1`
-uses the source length as its default per-rank cap. For common-layout heldout
-evaluation, set `MIMO_LOAD`, `MIMO_LAYOUT=cp1`, and `EVAL_ITERS=4`, then append
-`--skip-train --no-load-optim`. No GTP/EGTP weight sharding is enabled.
+not imply that every rank is padded to that length. `MIMO_LAYOUT=static_cp`
+requires each padded source sequence to fit `CP_SIZE * MAX_SEQLEN_PER_RANK`;
+CP8 at 8192 per rank cannot admit every 128K sample. Choose a matching static
+capacity and validate its memory use separately. `MIMO_LAYOUT=cp1` uses the source
+length as its default per-rank cap; 128K CP1 is not a validated memory-fit recipe.
+For heldout evaluation that fits memory, set `MIMO_LOAD`, `EVAL_ITERS=4`, and
+append `--skip-train --no-load-optim`. Use a separate output directory for each
+layout. No GTP/EGTP weight sharding is enabled.
 
 Use `DECODER_RECOMPUTE=full|selective|none`, `VISION_RECOMPUTE=0|1`, and
 `GDN_KERNEL_BACKEND=fla|transformer_engine` to select other memory/backend tradeoffs.
+For a custom CLI recompute policy, set `DECODER_RECOMPUTE=none` first so no
+incompatible default recompute arguments remain. Set `HELDOUT_IMAGES` to suit
+the dataset; the 256-document validation fixture used `HELDOUT_IMAGES=4`.
 The default was validated on 16 GB200 GPUs with PyTorch
 `2.13.0a0+8145d630e8.nv26.6.54250401`, Transformer Engine `2.21.0.dev0+eb56ba22`,
 cuDNN `9.25.1.1`, and cuDNN Frontend `1.33.0`. Frontend 1.33 includes the
