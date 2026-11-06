@@ -20,12 +20,8 @@ support. GPT and Hybrid models support dynamic CP. The batch fetch records each
 microbatch's selected CP group, size, and (under TP sequence parallelism) TP×CP
 group on `PackedSeqParams`; backend attention calls filter out these MCore-only fields.
 
-Batch helpers use `dynamic_cp` and `dynamic_cp_group_func`. The old `is_hybrid_cp`
-and `hybrid_cp_group_func` keyword arguments remain accepted with a deprecation
-warning for downstream callers. Positional arguments and the legacy
-`hybrid_cp_group` batch metadata are unchanged during this compatibility window.
-The deprecated keywords also remain visible to signature-based feature detection
-used by downstream consumers such as MBridge.
+Batch helpers use `dynamic_cp` and `dynamic_cp_group_func`, and store the selected
+CP communicator in the `runtime_cp_group` batch metadata field.
 
 The `gpt_packed_train_eval` functional test runs the real GPT entrypoint on eight
 GPUs with TP2/PP2, synthetic variable-length data, and static or dynamic packing.

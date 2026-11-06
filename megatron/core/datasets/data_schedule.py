@@ -837,7 +837,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             if dynamic_cp
             else cp_group
         )
-        batch['hybrid_cp_group'] = runtime_cp_group if dynamic_cp else None
+        batch['runtime_cp_group'] = runtime_cp_group if dynamic_cp else None
         # The CP batch sharders expect (1, num_seqs + 1) cu_seqlens, as returned by
         # flatten_batch_for_packed_sequences; the per-document sharder reads row 0.
         batch['cu_seqlens'] = batch['cu_seqlens'].unsqueeze(0)

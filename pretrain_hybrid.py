@@ -74,13 +74,13 @@ except ImportError:
 
 stimer = StragglerDetector()
 
-# Canonical, ordered batch schema. Kept alphabetical to match the
-# historical ``sorted(batch.keys())`` order.
+# Canonical batch schema. Preserve the historical tuple positions even when
+# metadata fields are renamed.
 BATCH_KEYS = [
     "attention_mask",
     "cu_seqlens",
     "cu_seqlens_padded",
-    "hybrid_cp_group",
+    "runtime_cp_group",
     "labels",
     "local_cp_size",
     "loss_mask",

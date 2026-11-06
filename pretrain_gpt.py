@@ -76,13 +76,13 @@ except ImportError:
 
 stimer = StragglerDetector()
 
-# Canonical, ordered schema of the fields ``get_batch`` returns. Kept alphabetical
-# to match the historical ``sorted(batch.keys())`` order that callers unpack into.
+# Canonical schema of the fields ``get_batch`` returns. Preserve tuple positions
+# when renaming metadata fields, since callers unpack this ordered list.
 BATCH_KEYS = [
     "attention_mask",
     "cu_seqlens",
     "cu_seqlens_padded",
-    "hybrid_cp_group",
+    "runtime_cp_group",
     "labels",
     "local_cp_size",
     "loss_mask",
@@ -218,8 +218,7 @@ def get_batch(
     # names regardless of any provenance fields wrappers like BlendedDataset
     # add (e.g. "dataset_id"). The for-loop above already populates every
     # BATCH_KEYS entry on tp_rank 0; other tp_ranks receive a fresh dict from
-    # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
-    # the historical sorted(batch.keys()) order.
+    # get_batch_on_this_tp_rank. Keep the explicit schema order for tuple callers.
     return [batch[key] for key in BATCH_KEYS]
 
 
@@ -369,7 +368,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 attention_mask,
                 cu_seqlens,
                 cu_seqlens_padded,
-                hybrid_cp_group,
+                runtime_cp_group,
                 labels,
                 local_cp_size,
                 loss_mask,
@@ -401,7 +400,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     max_seqlen_q=int(max_seqlen.item()),
                     max_seqlen_kv=int(max_seqlen.item()),
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
-                    cp_group=hybrid_cp_group,
+                    cp_group=runtime_cp_group,
                     tokens_per_sample=args.seq_length,
                 )
 
